@@ -299,3 +299,19 @@ class MD17DynamicsDataset(MD17Dataset):
         self.cfg = self.sample_cfg()
 
         print('number of atoms in the molecule:', n_node)
+
+if __name__ == "__main__":
+    # load the dataset, and visualize the magnitude of the positions and velocities 
+    dataset = MD17DynamicsDataset(partition='train', max_samples=500, delta_frame=3000, molecule_type='benzene_old', data_dir='md17', num_timesteps=8, uneven_sampling=False, internal_seed=None)
+    # visualize the magnitude of the positions and velocities
+    x_0 = dataset.x_0.numpy()
+    v_0 = dataset.v_0.numpy()
+    print(x_0.shape, v_0.shape)
+    print(np.max(x_0), np.min(x_0))
+    print(np.max(v_0), np.min(v_0))
+    # plot the positions and velocities
+    import matplotlib.pyplot as plt 
+    fig, axs = plt.subplots(2, 1, figsize=(10, 10))
+    axs[0].hist(x_0.flatten(), bins=100)
+    axs[1].hist(v_0.flatten(), bins=100)
+    plt.show()

@@ -2,7 +2,7 @@ import argparse
 from argparse import Namespace
 import torch
 import torch.utils.data
-from md17.dataset import MD17DynamicsDataset as MD17Dataset
+# from md17.dataset import MD17DynamicsDataset as MD17Dataset
 from model.fourier_md import FourierMD 
 import os, sys, time 
 from torch import nn, optim
@@ -105,6 +105,14 @@ if args.config_by_file:
 # assert torch.cuda.is_available(), "no cuda device available"
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
+if args.mol == "ala2": 
+    from ala.dataset import AlanineDataset as MoleculeDynamicsDataset 
+elif args.mol in ["aspirin", "benzene_old", "ethanol", "malonaldehyde", "naphthalene", "salicylic", "toluene", "uracil"]: 
+    from md17.dataset import MD17DynamicsDataset as MoleculeDynamicsDataset
+else: 
+    raise ValueError(f"Molecule {args.mol} not supported") 
+ 
+
 device = torch.device("cuda" if args.cuda else "cpu")
 loss_mse = nn.MSELoss(reduction='none')
 
@@ -169,21 +177,21 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    dataset_train = MD17Dataset(partition='train', max_samples=args.max_training_samples, data_dir=args.data_dir,
+    dataset_train = MoleculeDynamicsDataset(partition='train', max_samples=args.max_training_samples, data_dir=args.data_dir,
                                 molecule_type=args.mol, delta_frame=args.delta_frame,
                                 num_timesteps=args.num_timesteps, 
                                 uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
     loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True, drop_last=True,
                                                num_workers=0)
 
-    dataset_val = MD17Dataset(partition='val', max_samples=2000, data_dir=args.data_dir,
+    dataset_val = MoleculeDynamicsDataset(partition='val', max_samples=2000, data_dir=args.data_dir,
                                 molecule_type=args.mol, delta_frame=args.delta_frame,
                                 num_timesteps=args.num_timesteps, 
                                 uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
     loader_val = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size, shuffle=False, drop_last=False,
                                              num_workers=0)
 
-    dataset_test = MD17Dataset(partition='test', max_samples=2000, data_dir=args.data_dir,
+    dataset_test = MoleculeDynamicsDataset(partition='test', max_samples=2000, data_dir=args.data_dir,
                                 molecule_type=args.mol, delta_frame=args.delta_frame,
                                 num_timesteps=args.num_timesteps, 
                                 uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)

@@ -8,7 +8,7 @@ import os, sys, time
 from torch import nn, optim
 import json
 from torch.optim.lr_scheduler import StepLR
-from ala.evaluate_utils import compute_bond_lengths, compute_bond_angles, compute_dihedral_angles, compute_errors, plot_ramachandran
+from ala.evaluate_utils import compute_bond_lengths, compute_bond_angles, compute_dihedral_angles, compute_errors, plot_ramachandran, compute_kde_and_distribution_shift
 import matplotlib.pyplot as plt 
 
 import random
@@ -327,16 +327,16 @@ def evaluate(model, loader):
         (atom_indices['N_ALA'], atom_indices['CA_ALA'], atom_indices['C_ALA'], atom_indices['N_NME'])
     ]
 
-
-
     model.eval()
     bond_length_errors = []
     bond_angle_errors = []
+    bond_length_rel_errors = []
+    bond_angle_rel_errors = []
+
     phi_angles_pred = []
     psi_angles_pred = []
     phi_angles_gt = []
     psi_angles_gt = []
-
 
     for batch_idx, data in enumerate(loader):
         batch_size, n_nodes, _ = data[0].size()
@@ -377,35 +377,50 @@ def evaluate(model, loader):
         loc_pred_np = loc_pred.cpu().numpy().reshape(-1, n_nodes, 3)
         loc_gt_np = loc_end.cpu().numpy().reshape(-1, n_nodes, 3)        
 
-        losses = loss_mse(loc_pred, loc_end).view(args.num_timesteps, batch_size * n_nodes, 3)
-        losses = torch.mean(losses, dim=(1, 2))
-        loss = torch.mean(losses)
-
         # Compute bond lengths and angles
         bond_lengths_pred = compute_bond_lengths(loc_pred_np, bond_pairs)
         bond_lengths_gt = compute_bond_lengths(loc_gt_np, bond_pairs)
+
+        # Absolute errors
         mae_bond_length, _ = compute_errors(bond_lengths_pred, bond_lengths_gt)
         bond_length_errors.append(mae_bond_length)
-        
+
+        # Relative errors
+        bond_length_rel_error = np.abs((bond_lengths_pred - bond_lengths_gt) / bond_lengths_gt)
+        mae_bond_length_rel = np.mean(bond_length_rel_error)
+        bond_length_rel_errors.append(mae_bond_length_rel)
+
         bond_angles_pred = compute_bond_angles(loc_pred_np, angle_triplets)
         bond_angles_gt = compute_bond_angles(loc_gt_np, angle_triplets)
+
+        # Absolute errors
         mae_bond_angle, _ = compute_errors(bond_angles_pred, bond_angles_gt)
         bond_angle_errors.append(mae_bond_angle)
-        
+
+        # Relative errors
+        bond_angle_rel_error = np.abs((bond_angles_pred - bond_angles_gt) / bond_angles_gt)
+        mae_bond_angle_rel = np.mean(bond_angle_rel_error)
+        bond_angle_rel_errors.append(mae_bond_angle_rel)
+
         # Compute torsion angles
         dihedral_angles_pred = compute_dihedral_angles(loc_pred_np, torsion_quartets)
         dihedral_angles_gt = compute_dihedral_angles(loc_gt_np, torsion_quartets)
+
         phi_angles_pred.extend(dihedral_angles_pred[:, 0])
         psi_angles_pred.extend(dihedral_angles_pred[:, 1])
         phi_angles_gt.extend(dihedral_angles_gt[:, 0])
         psi_angles_gt.extend(dihedral_angles_gt[:, 1])
-        
+
     # Aggregate results
     avg_bond_length_error = np.mean(bond_length_errors)
     avg_bond_angle_error = np.mean(bond_angle_errors)
-    
+    avg_bond_length_rel_error = np.mean(bond_length_rel_errors)
+    avg_bond_angle_rel_error = np.mean(bond_angle_rel_errors)
+
     print(f"Average Bond Length MAE: {avg_bond_length_error}")
+    print(f"Average Bond Length Relative MAE: {avg_bond_length_rel_error}")
     print(f"Average Bond Angle MAE: {avg_bond_angle_error}")
+    print(f"Average Bond Angle Relative MAE: {avg_bond_angle_rel_error}")
     
     # Plot Ramachandran Plot
     plot_ramachandran(np.array(phi_angles_gt), np.array(psi_angles_gt), title='Ground Truth Ramachandran Plot', save_path=os.path.join(args.ref_path, 'ramachandran_gt.pdf'))
@@ -428,6 +443,18 @@ def evaluate(model, loader):
     # plt.savefig('ramachandran_plot_comparison.pdf') 
     plt.savefig(os.path.join(args.ref_path, 'ramachandran_plot_comparison.pdf'))
 
+
+
+    # Compute KDE and distribution shift
+    compute_kde_and_distribution_shift(
+        phi_angles_gt, psi_angles_gt, phi_angles_pred, psi_angles_pred, args.ref_path
+    )
+
+    # Save torsion angles to files for later processing
+    np.savez(os.path.join(args.ref_path, 'torsion_angles_pred.npz'),
+             phi=phi_angles_pred, psi=psi_angles_pred)
+    np.savez(os.path.join(args.ref_path, 'torsion_angles_gt.npz'),
+             phi=phi_angles_gt, psi=psi_angles_gt)
 
 
 if __name__ == "__main__":

@@ -26,5 +26,7 @@
         "uneven_sampling": false, 
         "fourier_basis": "graph", 
         "no_fourier": false,
-        "no_ode": false
+        "no_ode": false, 
+        "kl_weight": 1.0, 
+        "use_vae": true
 }

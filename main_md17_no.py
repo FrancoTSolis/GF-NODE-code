@@ -2,7 +2,6 @@ import argparse
 from argparse import Namespace
 import torch
 import torch.utils.data
-# from md17.dataset import MD17DynamicsDataset as MD17Dataset
 from model.fourier_md import FourierMD 
 import os, sys, time 
 from torch import nn, optim
@@ -91,6 +90,11 @@ parser.add_argument('--no_ode', action='store_true', default=False,
 parser.add_argument('--no_fourier', action='store_true', default=False,
                     help='No Fourier block')
 
+# Add use_vae argument
+parser.add_argument('--use_vae', action='store_true', default=False, help='Use VAE architecture')
+
+# 1. Added kl_weight argument
+parser.add_argument('--kl_weight', type=float, default=1.0, help='Weight for the KL divergence term in VAE loss')
 
 args = parser.parse_args()
 if args.config_by_file:
@@ -111,7 +115,7 @@ elif args.mol in ["aspirin", "benzene_old", "ethanol", "malonaldehyde", "naphtha
     from md17.dataset import MD17DynamicsDataset as MoleculeDynamicsDataset
 else: 
     raise ValueError(f"Molecule {args.mol} not supported") 
- 
+
 
 device = torch.device("cuda" if args.cuda else "cpu")
 loss_mse = nn.MSELoss(reduction='none')
@@ -172,32 +176,33 @@ def main():
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if args.cuda:
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
     dataset_train = MoleculeDynamicsDataset(partition='train', max_samples=args.max_training_samples, data_dir=args.data_dir,
-                                molecule_type=args.mol, delta_frame=args.delta_frame,
-                                num_timesteps=args.num_timesteps, 
-                                uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
+                                            molecule_type=args.mol, delta_frame=args.delta_frame,
+                                            num_timesteps=args.num_timesteps, 
+                                            uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
     loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True, drop_last=True,
                                                num_workers=0)
 
     dataset_val = MoleculeDynamicsDataset(partition='val', max_samples=2000, data_dir=args.data_dir,
-                                molecule_type=args.mol, delta_frame=args.delta_frame,
-                                num_timesteps=args.num_timesteps, 
-                                uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
+                                          molecule_type=args.mol, delta_frame=args.delta_frame,
+                                          num_timesteps=args.num_timesteps, 
+                                          uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
     loader_val = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size, shuffle=False, drop_last=False,
                                              num_workers=0)
 
     dataset_test = MoleculeDynamicsDataset(partition='test', max_samples=2000, data_dir=args.data_dir,
-                                molecule_type=args.mol, delta_frame=args.delta_frame,
-                                num_timesteps=args.num_timesteps, 
-                                uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
+                                           molecule_type=args.mol, delta_frame=args.delta_frame,
+                                           num_timesteps=args.num_timesteps, 
+                                           uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
     loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=args.batch_size, shuffle=False, drop_last=False,
                                               num_workers=0)
-    
+
     delta_frame = args.delta_frame
 
     if args.no_fourier:
@@ -210,7 +215,7 @@ def main():
                           num_timesteps=args.num_timesteps, time_emb_dim=args.time_emb_dim, 
                           num_atoms=None, solver=args.solver, rtol=args.rtol, atol=args.atol, 
                           delta_frame=delta_frame, fourier_basis=args.fourier_basis, 
-                          no_ode=args.no_ode, no_fourier=args.no_fourier)
+                          no_ode=args.no_ode, no_fourier=args.no_fourier, use_vae=args.use_vae)
     else:
         raise Exception("Wrong model specified")
 
@@ -222,19 +227,24 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = StepLR(optimizer, step_size=2500, gamma=0.5)
 
-    results = {'epochs': [], 'loss': [], 'train loss': []}
+    results = {'epochs': [], 'test loss': [], 'val loss': [], 'train loss': []}
     best_val_loss = 1e8
     best_test_loss = 1e8
     best_epoch = 0
     best_train_loss = 1e8
     for epoch in range(args.epochs):
         train_loss = train(model, optimizer, epoch, loader_train)
+        # Report the reconstruction loss for each epoch
+        print('Epoch %d Train Reconstruction Loss: %.5f' % (epoch, train_loss))
         results['train loss'].append(train_loss)
         if epoch % args.test_interval == 0:
             val_loss = train(model, optimizer, epoch, loader_val, backprop=False)
             test_loss = train(model, optimizer, epoch, loader_test, backprop=False)
+            print('Epoch %d Val Reconstruction Loss: %.5f' % (epoch, val_loss))
+            print('Epoch %d Test Reconstruction Loss: %.5f' % (epoch, test_loss))
             results['epochs'].append(epoch)
-            results['loss'].append(test_loss)
+            results['val loss'].append(val_loss)
+            results['test loss'].append(test_loss)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_test_loss = test_loss
@@ -242,7 +252,7 @@ def main():
                 best_epoch = epoch
                 torch.save(model.state_dict(), model_save_path)
                 print("==> best model saved at epoch %d" % epoch)
-            print("*** Best Val Loss: %.5f \t Best Test Loss: %.5f \t Best apoch %d"
+            print("*** Best Val Loss: %.5f \t Best Test Loss: %.5f \t Best epoch %d"
                   % (best_val_loss, best_test_loss, best_epoch))
         scheduler.step()
 
@@ -258,7 +268,8 @@ def train(model, optimizer, epoch, loader, backprop=True):
     else:
         model.eval()
 
-    res = {'epoch': epoch, 'loss': 0, 'counter': 0}
+    # 2. Updated to track reconstruction and combined loss
+    res = {'epoch': epoch, 'loss': 0, 'counter': 0, 'recon_loss': 0, 'combined_loss': 0}
 
     for batch_idx, data in enumerate(loader):
         batch_size, n_nodes, _ = data[0].size()
@@ -291,28 +302,50 @@ def train(model, optimizer, epoch, loader, backprop=True):
             loc_dist = torch.sum((loc[rows] - loc[cols])**2, 1).unsqueeze(1)  # relative distances among locations
             edge_attr = torch.cat([edge_attr, loc_dist], 1).detach()  # concatenate all edge properties
             loc_mean = loc.view(batch_size, n_nodes, 3).mean(dim=1, keepdim=True).repeat(1, n_nodes, 1).view(-1, 3)  # [BN, 3]
-            loc_pred, vel_pred, _ = model(loc.detach(), nodes, edges, edge_attr, vel, loc_mean=loc_mean, timeframes=timeframes, 
-                                          U_batch=U_batch) 
+            if args.use_vae:
+                loc_pred, vel_pred, _, kld_loss = model(loc.detach(), nodes, edges, edge_attr, vel,
+                                                        loc_mean=loc_mean, timeframes=timeframes,
+                                                        U_batch=U_batch)
+            else:
+                loc_pred, vel_pred, _ = model(loc.detach(), nodes, edges, edge_attr, vel, loc_mean=loc_mean,
+                                              timeframes=timeframes,
+                                              U_batch=U_batch)
+                kld_loss = torch.tensor(0.0, device=device)  # Ensure kld_loss is defined
         else:
             raise Exception("Wrong model")
 
         losses = loss_mse(loc_pred, loc_end).view(args.num_timesteps, batch_size * n_nodes, 3)
         losses = torch.mean(losses, dim=(1, 2))
-        loss = torch.mean(losses)
+        recon_loss = torch.mean(losses)
+
+        if args.use_vae:
+            # Use combined loss for backpropagation
+            loss = recon_loss + args.kl_weight * kld_loss
+        else:
+            loss = recon_loss
 
         if backprop:
             loss.backward()
             optimizer.step()
-        res['loss'] += losses[-1].item()*batch_size
+        # Accumulate losses
+        res['recon_loss'] += recon_loss.item() * batch_size
+        res['combined_loss'] += loss.item() * batch_size
         res['counter'] += batch_size
+
+    avg_recon_loss = res['recon_loss'] / res['counter']
+    avg_combined_loss = res['combined_loss'] / res['counter']
 
     if not backprop:
         prefix = "==> "
     else:
         prefix = ""
-    print('%s epoch %d avg loss: %.5f' % (prefix+loader.dataset.partition, epoch, res['loss'] / res['counter']))
 
-    return res['loss'] / res['counter']
+    # Report both reconstruction loss and combined loss
+    print('%s epoch %d avg recon loss: %.5f avg combined loss: %.5f' %
+          (prefix + loader.dataset.partition, epoch, avg_recon_loss, avg_combined_loss))
+
+    # Return reconstruction loss
+    return avg_recon_loss
 
 
 if __name__ == "__main__":
@@ -321,7 +354,6 @@ if __name__ == "__main__":
     print("best_val = %.6f" % best_val_loss)
     print("best_test = %.6f" % best_test_loss)
     print("best_epoch = %d" % best_epoch)
-
 
 # Close the file descriptor at the end of the program
 os.close(file_descriptor)

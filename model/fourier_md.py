@@ -9,7 +9,8 @@ class FourierMD(nn.Module):
                  flat=False, norm=False, num_modes=2, num_timesteps=8, time_emb_dim=32, 
                  num_atoms=5, solver='dopri5', rtol=1e-3, atol=1e-4, delta_frame=None, 
                  fourier_basis=None, 
-                 no_fourier=False, no_ode=False):  
+                 no_fourier=False, no_ode=False,
+                 use_vae=False):  
         super(FourierMD, self).__init__()
         self.encode_layers = nn.ModuleList() 
         self.decode_layers = nn.ModuleList() 
@@ -35,7 +36,7 @@ class FourierMD(nn.Module):
 
         self.no_fourier = no_fourier 
         self.no_ode = no_ode 
-
+        self.use_vae = use_vae 
 
         # input feature mapping 
         self.embedding = nn.Linear(in_node_nf, self.encode_hidden_nf)
@@ -43,6 +44,14 @@ class FourierMD(nn.Module):
             layer = EGNN_Layer(in_edge_nf, self.encode_hidden_nf, activation=activation, with_v=with_v, flat=flat, norm=norm)
             self.encode_layers.append(layer) 
         
+        if self.use_vae:
+            # Define layers to compute mean and logvar for h
+            self.fc_mu_h = nn.Linear(self.encode_hidden_nf, self.encode_hidden_nf)
+            self.fc_logvar_h = nn.Linear(self.encode_hidden_nf, self.encode_hidden_nf)
+            # Similarly for x
+            self.fc_mu_x = nn.Linear(3, 3)
+            self.fc_logvar_x = nn.Linear(3, 3)
+
         self.freq_conv = TimeConvODE(self.encode_hidden_nf, self.encode_hidden_nf, num_modes, activation, 
                                      solver, rtol, atol, fourier_basis=fourier_basis, 
                                      no_fourier=no_fourier, no_ode=no_ode) 
@@ -68,9 +77,30 @@ class FourierMD(nn.Module):
         for i in range(self.n_layers):
             x, v, h = self.encode_layers[i](x, h, edge_index, edge_fea, v=v)
 
+        if self.use_vae:
+            # For h
+            mu_h = self.fc_mu_h(h)
+            logvar_h = self.fc_logvar_h(h)
+            std_h = torch.exp(0.5 * logvar_h)
+            eps_h = torch.randn_like(std_h)
+            h = mu_h + eps_h * std_h  # Reparameterization trick
+
+            # For x
+            mu_x = self.fc_mu_x(x)
+            logvar_x = self.fc_logvar_x(x)
+            std_x = torch.exp(0.5 * logvar_x)
+            eps_x = torch.randn_like(std_x)
+            x = mu_x + eps_x * std_x
+
+            # Compute KL divergence
+            kld_h = -0.5 * torch.sum(1 + logvar_h - mu_h.pow(2) - logvar_h.exp(), dim=1)
+            kld_x = -0.5 * torch.sum(1 + logvar_x - mu_x.pow(2) - logvar_x.exp(), dim=1)
+            kld_loss = (kld_h + kld_x).mean()  # Average over batch
+        else:
+            kld_loss = torch.tensor(0.0, device=x.device)
+
         # normalize the timeframes to (0, 1], important for numerical stability of ode solver
         normalized_timeframes = timeframes / self.delta_frame 
-
 
         h = self.freq_conv(h.view((B, N, -1)), normalized_timeframes, U_batch) # [T, B, N, E]
 
@@ -90,7 +120,6 @@ class FourierMD(nn.Module):
         time_emb = time_emb.unsqueeze(2).repeat(1, 1, N, 1)  # Shape: [B, T, N, H_t]
         time_emb = time_emb.swapaxes(0, 1).contiguous().view(T, num_nodes, -1)  # Shape: [T, BN, H_t]
 
-
         h = h.contiguous().view(T, num_nodes, -1)  # [T, BN, H]
         h = torch.cat((h, time_emb), dim=-1)  # [T, BN, H+H_t]
         h = h.view(-1, h.shape[-1])  # [T*BN, H+H_t]
@@ -107,7 +136,7 @@ class FourierMD(nn.Module):
         for i in range(self.n_layers): 
             x, v, h = self.decode_layers[i](x, h, edge_index, edge_fea, v=v)
 
-        return x, v, h 
+        return x, v, h, kld_loss 
 
         
 # test FourierMD 

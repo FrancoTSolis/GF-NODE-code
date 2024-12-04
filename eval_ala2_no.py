@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 
 import random
 import numpy as np
+from deeptime.decomposition import VAMP
+from sklearn.preprocessing import StandardScaler
 
 parser = argparse.ArgumentParser(description='FourierMD')
 parser.add_argument('--exp_name', type=str, default='exp_1', metavar='N', help='experiment_name')
@@ -338,6 +340,18 @@ def evaluate(model, loader):
     phi_angles_gt = []
     psi_angles_gt = []
 
+    # Initialize lists to collect features for VAMP2 score
+    X = []
+    Y = []
+
+    # Compute the time lag step (assuming integer steps)
+    lag_step = 1  # Adjust as necessary; must be less than args.num_timesteps
+    assert lag_step < args.num_timesteps, "lag_step must be less than num_timesteps"
+
+    # Compute the actual time lag based on delta_frame and num_timesteps
+    time_lag = (args.delta_frame / args.num_timesteps) * lag_step
+    print(f"Time lag for VAMP2 score: {time_lag}")
+
     for batch_idx, data in enumerate(loader):
         batch_size, n_nodes, _ = data[0].size()
         if model.num_atoms is None: 
@@ -346,7 +360,7 @@ def evaluate(model, loader):
             assert model.num_atoms == n_nodes, "Number of atoms should be the same" 
         data, cfg = data[:-1], data[-1]
         data = [d.to(device) for d in data]
-        data = [d.view(-1, d.size(-1)) for d in data]  # construct mini-batch graphs
+        data = [d.view(-1, d.size(-1)) for d in data]  # Construct mini-batch graphs
         for i in [4, 5]:
             d = data[i].view(batch_size * n_nodes, args.num_timesteps, 3)
             data[i] = d.transpose(0, 1).contiguous().view(-1, 3)
@@ -360,19 +374,31 @@ def evaluate(model, loader):
         cfg = loader.dataset.get_cfg(batch_size, n_nodes, cfg)
         cfg = {_: cfg[_].to(device) for _ in cfg}
 
-
         if args.model == 'fourier':
             nodes = torch.sqrt(torch.sum(vel ** 2, dim=1)).unsqueeze(1).detach()
             nodes = torch.cat((nodes, Z / Z.max()), dim=-1)
             rows, cols = edges
-            loc_dist = torch.sum((loc[rows] - loc[cols])**2, 1).unsqueeze(1)  # relative distances among locations
-            edge_attr = torch.cat([edge_attr, loc_dist], 1).detach()  # concatenate all edge properties
-            loc_mean = loc.view(batch_size, n_nodes, 3).mean(dim=1, keepdim=True).repeat(1, n_nodes, 1).view(-1, 3)  # [BN, 3]
-            loc_pred, vel_pred, _ = model(loc.detach(), nodes, edges, edge_attr, vel, loc_mean=loc_mean, timeframes=timeframes, 
-                                          U_batch=U_batch) 
+            loc_dist = torch.sum((loc[rows] - loc[cols]) ** 2, 1).unsqueeze(1)  # Relative distances among locations
+            edge_attr = torch.cat([edge_attr, loc_dist], 1).detach()  # Concatenate all edge properties
+            loc_mean = (
+                loc.view(batch_size, n_nodes, 3)
+                .mean(dim=1, keepdim=True)
+                .repeat(1, n_nodes, 1)
+                .view(-1, 3)
+            )  # [BN, 3]
+            loc_pred, vel_pred, _ = model(
+                loc.detach(),
+                nodes,
+                edges,
+                edge_attr,
+                vel,
+                loc_mean=loc_mean,
+                timeframes=timeframes,
+                U_batch=U_batch,
+            )
         else:
             raise Exception("Wrong model")
-        
+
         # Convert to numpy
         loc_pred_np = loc_pred.cpu().numpy().reshape(-1, n_nodes, 3)
         loc_gt_np = loc_end.cpu().numpy().reshape(-1, n_nodes, 3)        
@@ -410,6 +436,42 @@ def evaluate(model, loader):
         psi_angles_pred.extend(dihedral_angles_pred[:, 1])
         phi_angles_gt.extend(dihedral_angles_gt[:, 0])
         psi_angles_gt.extend(dihedral_angles_gt[:, 1])
+
+        # Prepare features for VAMP2
+        # Reshape predictions for VAMP2 computation
+        loc_pred_flat = loc_pred_np.reshape(args.num_timesteps, batch_size, n_nodes * 3)
+
+        # Collect time-lagged pairs
+        for t in range(loc_pred_flat.shape[0] - lag_step):
+            X.append(loc_pred_flat[t])
+            Y.append(loc_pred_flat[t + lag_step])
+
+    # After the loop over batches
+    X = np.concatenate(X, axis=0)  # Shape: [num_samples, n_nodes * 3]
+    Y = np.concatenate(Y, axis=0)
+
+    # Normalize the data
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    Y_scaled = scaler.transform(Y)
+
+    # Compute VAMP2 Score
+    vamp = VAMP(lagtime=1, scaling=None)  # lagtime is set to 1 because lag is represented in steps
+    vamp.fit((X_scaled, Y_scaled))
+    vamp2_score = vamp.score((X_scaled, Y_scaled))
+
+    print(f"VAMP2 Score: {vamp2_score}")
+
+    # Optionally, you can print singular values
+    singular_values = vamp.singular_values_
+    print(f"Singular Values: {singular_values}")
+
+    # compute ground truth VAMP2 score 
+    loc_gt_flat = loc_gt_np.reshape(-1, n_nodes * 3)
+    Y_scaled_gt = scaler.transform(loc_gt_flat)
+    vamp2_score_gt = vamp.score((X_scaled, Y_scaled_gt))
+    print(f"Ground Truth VAMP2 Score: {vamp2_score_gt}")
+
 
     # Aggregate results
     avg_bond_length_error = np.mean(bond_length_errors)

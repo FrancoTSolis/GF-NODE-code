@@ -307,7 +307,7 @@ def train(model, optimizer, epoch, loader, backprop=True):
                                                         loc_mean=loc_mean, timeframes=timeframes,
                                                         U_batch=U_batch)
             else:
-                loc_pred, vel_pred, _ = model(loc.detach(), nodes, edges, edge_attr, vel, loc_mean=loc_mean,
+                loc_pred, vel_pred, _, kld_loss = model(loc.detach(), nodes, edges, edge_attr, vel, loc_mean=loc_mean,
                                               timeframes=timeframes,
                                               U_batch=U_batch)
                 kld_loss = torch.tensor(0.0, device=device)  # Ensure kld_loss is defined

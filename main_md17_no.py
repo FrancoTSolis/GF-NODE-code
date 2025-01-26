@@ -89,6 +89,7 @@ parser.add_argument('--no_ode', action='store_true', default=False,
                     help='No ODE block')
 parser.add_argument('--no_fourier', action='store_true', default=False,
                     help='No Fourier block')
+parser.add_argument('--gnn_ablation_mode', type=str, default='EGNN', help='GNN ablation mode, egnn, gcn, or graphsage')
 
 # Add use_vae argument
 parser.add_argument('--use_vae', action='store_true', default=False, help='Use VAE architecture')
@@ -123,6 +124,10 @@ loss_mse = nn.MSELoss(reduction='none')
 assert not (args.no_fourier and args.no_ode), "Cannot remove both Fourier and ODE block" 
 # exp_name plus a time stamp in format MMDDHHMMSS 
 args.time = time.strftime("%m%d%H%M%S")
+
+
+args.exp_name = args.exp_name + "_" + args.gnn_ablation_mode
+
 if args.no_fourier: 
     args.exp_name = args.exp_name + "_" + args.mol + "_" + "no_fourier" + "_" + args.time
 elif args.no_ode: 
@@ -215,7 +220,8 @@ def main():
                           num_timesteps=args.num_timesteps, time_emb_dim=args.time_emb_dim, 
                           num_atoms=None, solver=args.solver, rtol=args.rtol, atol=args.atol, 
                           delta_frame=delta_frame, fourier_basis=args.fourier_basis, 
-                          no_ode=args.no_ode, no_fourier=args.no_fourier, use_vae=args.use_vae)
+                          no_ode=args.no_ode, no_fourier=args.no_fourier, use_vae=args.use_vae, 
+                          gnn_ablation_mode=args.gnn_ablation_mode)
     else:
         raise Exception("Wrong model specified")
 

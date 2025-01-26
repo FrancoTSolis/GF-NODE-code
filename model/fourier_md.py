@@ -3,14 +3,19 @@ import torch
 import torch.nn.functional as F
 from model.basic import EGNN_Layer 
 from model.layer_no_ode import TimeConvODE, TimeConvODE_x, get_timestep_embedding 
+from model.basic import GraphSAGE_Layer, GCN_Layer 
 
+###############################################################################
+# The FourierMD class (updated with gnn_ablation_mode)
+###############################################################################
 class FourierMD(nn.Module):
     def __init__(self, n_layers, in_node_nf, in_edge_nf, hidden_nf, activation=nn.SiLU(), device='cpu', with_v=False,
                  flat=False, norm=False, num_modes=2, num_timesteps=8, time_emb_dim=32, 
                  num_atoms=5, solver='dopri5', rtol=1e-3, atol=1e-4, delta_frame=None, 
                  fourier_basis=None, 
                  no_fourier=False, no_ode=False,
-                 use_vae=False):  
+                 use_vae=False,
+                 gnn_ablation_mode='EGNN'):  
         super(FourierMD, self).__init__()
         self.encode_layers = nn.ModuleList() 
         self.decode_layers = nn.ModuleList() 
@@ -37,11 +42,45 @@ class FourierMD(nn.Module):
         self.no_fourier = no_fourier 
         self.no_ode = no_ode 
         self.use_vae = use_vae 
+        self.gnn_ablation_mode = gnn_ablation_mode  # store the chosen ablation mode
 
         # input feature mapping 
         self.embedding = nn.Linear(in_node_nf, self.encode_hidden_nf)
+
+        # Depending on gnn_ablation_mode, choose the layer class
+        # We'll define a small helper:
+        def make_graph_layer(in_edge_nf, hidden_nf, activation, with_v, flat, norm):
+            if self.gnn_ablation_mode.lower() == 'egnn':
+                return EGNN_Layer(
+                    in_edge_nf, 
+                    hidden_nf, 
+                    activation=activation, 
+                    with_v=with_v, 
+                    flat=flat, 
+                    norm=norm
+                )
+            elif self.gnn_ablation_mode.lower() in ['sage', 'graphsage']:
+                return GraphSAGE_Layer(
+                    in_edge_nf,
+                    hidden_nf,
+                    activation=activation,
+                    with_v=with_v,
+                    flat=flat
+                )
+            elif self.gnn_ablation_mode.lower() == 'gcn':
+                return GCN_Layer(
+                    in_edge_nf,
+                    hidden_nf,
+                    activation=activation,
+                    with_v=with_v,
+                    flat=flat
+                )
+            else:
+                raise ValueError(f"Unknown gnn_ablation_mode: {self.gnn_ablation_mode}")
+
+        # Build encoder layers
         for i in range(self.n_layers):
-            layer = EGNN_Layer(in_edge_nf, self.encode_hidden_nf, activation=activation, with_v=with_v, flat=flat, norm=norm)
+            layer = make_graph_layer(in_edge_nf, self.encode_hidden_nf, activation, with_v, flat, norm)
             self.encode_layers.append(layer) 
         
         if self.use_vae:
@@ -59,9 +98,9 @@ class FourierMD(nn.Module):
                                          solver, rtol, atol, fourier_basis=fourier_basis, 
                                          no_fourier=no_fourier, no_ode=no_ode) 
 
-        # output feature mapping 
+        # Build decoder layers
         for i in range(self.n_layers):
-            layer = EGNN_Layer(in_edge_nf, self.decode_hidden_nf, activation=activation, with_v=with_v, flat=flat, norm=norm)
+            layer = make_graph_layer(in_edge_nf, self.decode_hidden_nf, activation, with_v, flat, norm)
             self.decode_layers.append(layer) 
 
         self.to(device)

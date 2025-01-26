@@ -365,3 +365,116 @@ class FullMLP(nn.ModuleList):
         for i in range(len(self.layers)):
             x = self.layers[i](x)
         return self.output(x)
+
+
+###############################################################################
+# Additional Ablation Layers
+###############################################################################
+
+def combine_xvh(x, v, h):
+    """
+    Combine x and v (each [BN,3]) and h ([BN, hidden_nf]) into a single
+    [BN, (hidden_nf + 6)] representation for aggregator-based layers.
+    """
+    return torch.cat([x, v, h], dim=-1)
+
+
+def split_xvh(combined):
+    """
+    Split the combined representation [BN, (hidden_nf + 6)] back into
+    x ([BN,3]), v ([BN,3]), and h ([BN, hidden_nf]).
+    """
+    x = combined[:, :3]
+    v = combined[:, 3:6]
+    h = combined[:, 6:]
+    return x, v, h
+
+class GraphSAGE_Layer(nn.Module):
+    """
+    A simple GraphSAGE-style layer that uses "mean" aggregator.
+    Now treats x, v as part of the node features (like h).
+    """
+    def __init__(self, in_edge_nf, hidden_nf, activation=nn.SiLU(), with_v=False, flat=False):
+        super(GraphSAGE_Layer, self).__init__()
+        self.with_v = with_v
+        self.combined_dim = hidden_nf + 6  # x(3) + v(3) + h(hidden_nf)
+        # Edges: 2*(combined_dim) + in_edge_nf
+        self.edge_mlp = BaseMLP(
+            input_dim=(2*self.combined_dim + in_edge_nf),
+            hidden_dim=self.combined_dim,
+            output_dim=self.combined_dim,
+            activation=activation,
+            flat=flat
+        )
+        # Node update: cat(combined, agg) => 2*combined_dim
+        self.node_mlp = BaseMLP(
+            input_dim=(self.combined_dim + self.combined_dim),
+            hidden_dim=self.combined_dim,
+            output_dim=self.combined_dim,
+            activation=activation,
+            flat=flat
+        )
+
+    def forward(self, x, h, edge_index, edge_fea, v=None):
+        # Combine x,v,h into one representation
+        combined = combine_xvh(x, v, h)  # [BN, combined_dim]
+        row, col = edge_index
+
+        # Build edge features
+        edge_combined = torch.cat([combined[row], combined[col], edge_fea], dim=-1)
+        message = self.edge_mlp(edge_combined)  # [E, combined_dim]
+
+        # Mean-aggregate over row index
+        agg = aggregate(message, row, combined.size(0), aggr='mean')  # [BN, combined_dim]
+
+        # Node-level update (residual)
+        new_combined = self.node_mlp(torch.cat([combined, agg], dim=-1))  # [BN, combined_dim]
+        combined = combined + new_combined  # residual connection
+
+        # Split back into x, v, h
+        x, v, h = split_xvh(combined)
+        return x, v, h
+
+
+class GCN_Layer(nn.Module):
+    """
+    A very simplified GCN-style layer, also treating x, v as part of the node feature.
+    """
+    def __init__(self, in_edge_nf, hidden_nf, activation=nn.SiLU(), with_v=False, flat=False):
+        super(GCN_Layer, self).__init__()
+        self.with_v = with_v
+        self.combined_dim = hidden_nf + 6  # x(3) + v(3) + h(hidden_nf)
+        self.edge_mlp = BaseMLP(
+            input_dim=(2*self.combined_dim + in_edge_nf),
+            hidden_dim=self.combined_dim,
+            output_dim=self.combined_dim,
+            activation=activation,
+            flat=flat
+        )
+        self.node_mlp = BaseMLP(
+            input_dim=self.combined_dim,
+            hidden_dim=self.combined_dim,
+            output_dim=self.combined_dim,
+            activation=activation,
+            flat=flat
+        )
+
+    def forward(self, x, h, edge_index, edge_fea, v=None):
+        # Combine x,v,h
+        combined = combine_xvh(x, v, h)  # [BN, combined_dim]
+        row, col = edge_index
+
+        # Build edge features
+        edge_combined = torch.cat([combined[row], combined[col], edge_fea], dim=-1)
+        message = self.edge_mlp(edge_combined)  # [E, combined_dim]
+
+        # Average aggregator (like a simplified GCN approach)
+        agg = aggregate(message, row, combined.size(0), aggr='mean')  # [BN, combined_dim]
+
+        # One simple transform, then residual
+        new_combined = self.node_mlp(agg)  # [BN, combined_dim]
+        combined = combined + new_combined  # residual
+
+        # Split
+        x, v, h = split_xvh(combined)
+        return x, v, h

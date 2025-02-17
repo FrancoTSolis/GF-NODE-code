@@ -97,6 +97,10 @@ parser.add_argument('--use_vae', action='store_true', default=False, help='Use V
 # 1. Added kl_weight argument
 parser.add_argument('--kl_weight', type=float, default=1.0, help='Weight for the KL divergence term in VAE loss')
 
+# New argument for mode_interaction
+parser.add_argument('--mode_interaction', type=str, default='no_interaction',
+                    help="Choose among: 'no_interaction', 'attention', 'concat' for the ODEFunction_real/_x.")
+
 args = parser.parse_args()
 if args.config_by_file:
     job_param_path = 'configs/' + args.config
@@ -214,14 +218,32 @@ def main():
         assert dataset_train.n_node == args.num_modes, "Number of modes must be the same as the number of atoms" 
         assert args.fourier_basis == None, "No Fourier block, so fourier_basis must be None" 
 
-    if args.model == 'fourier': 
-        model = FourierMD(n_layers=args.n_layers, in_node_nf=2, in_edge_nf=2 + 3, hidden_nf=args.nf, device=device,
-                          with_v=True, flat=args.flat, activation=nn.SiLU(), norm=args.norm, num_modes=args.num_modes,
-                          num_timesteps=args.num_timesteps, time_emb_dim=args.time_emb_dim, 
-                          num_atoms=None, solver=args.solver, rtol=args.rtol, atol=args.atol, 
-                          delta_frame=delta_frame, fourier_basis=args.fourier_basis, 
-                          no_ode=args.no_ode, no_fourier=args.no_fourier, use_vae=args.use_vae, 
-                          gnn_ablation_mode=args.gnn_ablation_mode)
+    if args.model == 'fourier':
+        model = FourierMD(
+            n_layers=args.n_layers,
+            in_node_nf=2,
+            in_edge_nf=2 + 3,
+            hidden_nf=args.nf,
+            device=device,
+            with_v=True,
+            flat=args.flat,
+            activation=nn.SiLU(),
+            norm=args.norm,
+            num_modes=args.num_modes,
+            num_timesteps=args.num_timesteps,
+            time_emb_dim=args.time_emb_dim,
+            num_atoms=None,
+            solver=args.solver,
+            rtol=args.rtol,
+            atol=args.atol,
+            delta_frame=delta_frame,
+            fourier_basis=args.fourier_basis,
+            no_ode=args.no_ode,
+            no_fourier=args.no_fourier,
+            use_vae=args.use_vae,
+            gnn_ablation_mode=args.gnn_ablation_mode,
+            mode_interaction=args.mode_interaction
+        )
     else:
         raise Exception("Wrong model specified")
 

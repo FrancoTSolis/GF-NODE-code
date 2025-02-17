@@ -15,7 +15,8 @@ class FourierMD(nn.Module):
                  fourier_basis=None, 
                  no_fourier=False, no_ode=False,
                  use_vae=False,
-                 gnn_ablation_mode='EGNN'):  
+                 gnn_ablation_mode='EGNN',
+                 mode_interaction='no_interaction'):  
         super(FourierMD, self).__init__()
         self.encode_layers = nn.ModuleList() 
         self.decode_layers = nn.ModuleList() 
@@ -43,6 +44,7 @@ class FourierMD(nn.Module):
         self.no_ode = no_ode 
         self.use_vae = use_vae 
         self.gnn_ablation_mode = gnn_ablation_mode  # store the chosen ablation mode
+        self.mode_interaction = mode_interaction
 
         # input feature mapping 
         self.embedding = nn.Linear(in_node_nf, self.encode_hidden_nf)
@@ -93,10 +95,12 @@ class FourierMD(nn.Module):
 
         self.freq_conv = TimeConvODE(self.encode_hidden_nf, self.encode_hidden_nf, num_modes, activation, 
                                      solver, rtol, atol, fourier_basis=fourier_basis, 
-                                     no_fourier=no_fourier, no_ode=no_ode) 
+                                     no_fourier=no_fourier, no_ode=no_ode,
+                                     mode_interaction=self.mode_interaction) 
         self.freq_conv_x = TimeConvODE_x(2, 2, num_modes, activation, 
                                          solver, rtol, atol, fourier_basis=fourier_basis, 
-                                         no_fourier=no_fourier, no_ode=no_ode) 
+                                         no_fourier=no_fourier, no_ode=no_ode,
+                                         mode_interaction=self.mode_interaction) 
 
         # Build decoder layers
         for i in range(self.n_layers):

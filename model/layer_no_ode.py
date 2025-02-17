@@ -128,26 +128,158 @@ class ODEFunction_complex(nn.Module):
         return out_ft
 
 class ODEFunction_real(nn.Module):
-    def __init__(self, in_ch, out_ch, modes1):
+    def __init__(self, in_ch, out_ch, modes1, mode_interaction='no_interaction', n_heads=1, hidden_dim=128):
+        """
+        ODEFunction_real now supports optional mode_interaction:
+            'no_interaction' -> Original scheme (default)
+            'attention'      -> Self-attention across modes
+            'concat'         -> Concatenate all modes into a single vector, feed through MLP
+        """
         super(ODEFunction_real, self).__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
         self.modes1 = modes1
-
         self.scale = (1 / (in_ch * out_ch))
+
+        # Original weights for direct mode-wise multiplication
         self.weights1 = nn.Parameter(
             self.scale * torch.rand(self.modes1, in_ch, out_ch, dtype=torch.float)
         )
+        self.mode_interaction = mode_interaction
+
+        # -- Self-Attention if requested --
+        if self.mode_interaction == 'attention':
+            # For shape [M, B, in_ch], we interpret M as seq_len, B as batch, in_ch as embed_dim
+            self.attn = nn.MultiheadAttention(embed_dim=in_ch, num_heads=n_heads, batch_first=False)
+            self.post_attn_linear = nn.Linear(in_ch, in_ch)
+
+        # -- Concatenate + MLP if requested --
+        elif self.mode_interaction == 'concat':
+            # We'll flatten the [M, in_ch] chunk, pass it through MLP, reshape back
+            self.mlp = nn.Sequential(
+                nn.Linear(self.modes1 * in_ch, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, self.modes1 * in_ch),
+            )
+
+        elif self.mode_interaction == 'no_interaction':
+            # Default: do nothing special
+            pass
+        else:
+            raise ValueError(
+                f"mode_interaction must be one of ['no_interaction', 'attention', 'concat'], got {self.mode_interaction}"
+            )
 
     def forward(self, t, x_hat):
-        # x_hat: [M, B, in_ch]
+        """
+        x_hat: [M, B, in_ch]
+        Returns: [M, B, out_ch]
+        """
+        # Step 1: Manage interaction among modes
+        if self.mode_interaction == 'attention':
+            # MultiheadAttention expects shape [seq_len, batch_size, embed_dim]
+            attn_out, _ = self.attn(x_hat, x_hat, x_hat)  # [M, B, in_ch]
+            x_hat = self.post_attn_linear(attn_out)       # [M, B, in_ch]
+
+        elif self.mode_interaction == 'concat':
+            # Flatten the modes dimension for each batch
+            # x_hat: [M, B, in_ch] -> [B, M, in_ch]
+            x_hat_perm = x_hat.permute(1, 0, 2)  # [B, M, in_ch]
+            B, M, C = x_hat_perm.shape
+            flattened = x_hat_perm.reshape(B, M * C)  # [B, M*in_ch]
+            updated = self.mlp(flattened)             # [B, M*in_ch]
+            # Reshape back
+            updated = updated.reshape(B, M, C)        # [B, M, in_ch]
+            x_hat = updated.permute(1, 0, 2)          # [M, B, in_ch]
+
+        # If 'no_interaction', nothing special is done here, so it remains original x_hat.
+
+        # Step 2: Original mode-wise linear transform
+        out_hat = torch.einsum("mni,mio->mno", x_hat, self.weights1)  # [M, B, out_ch]
+        return out_hat
+
+class ODEFunction_real_x(nn.Module):
+    def __init__(self, in_ch, out_ch, modes1, mode_interaction='no_interaction', n_heads=1, hidden_dim=128):
+        """
+        ODEFunction_real_x now supports optional mode_interaction:
+            'no_interaction' -> Original scheme (default)
+            'attention'      -> Self-attention across modes
+            'concat'         -> Concatenate all modes into a single vector, feed through MLP
+        """
+        super(ODEFunction_real_x, self).__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.modes1 = modes1
+        self.scale = (1 / (in_ch * out_ch))
+
+        # Weights shape: [modes1, in_ch, out_ch]
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(self.modes1, self.in_ch, self.out_ch, dtype=torch.float)
+        )
+        self.mode_interaction = mode_interaction
+
+        if self.mode_interaction == 'attention':
+            # We'll flatten [B, E] to treat M as seq_len => x_hat shape [M, B*E, in_ch]
+            self.attn = nn.MultiheadAttention(embed_dim=in_ch, num_heads=n_heads, batch_first=False)
+            self.post_attn_linear = nn.Linear(in_ch, in_ch)
+
+        elif self.mode_interaction == 'concat':
+            # We'll flatten the modes dimension for each [B, E] slice
+            self.mlp = nn.Sequential(
+                nn.Linear(self.modes1 * in_ch, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, self.modes1 * in_ch),
+            )
+
+        elif self.mode_interaction == 'no_interaction':
+            # Default: original scheme
+            pass
+        else:
+            raise ValueError(
+                f"mode_interaction must be one of ['no_interaction', 'attention', 'concat'], got {self.mode_interaction}"
+            )
+
+    def forward(self, t, x_hat):
+        """
+        x_hat: [M, B, E, in_ch]
+        M = number of modes
+        B = batch size
+        E = extra dimension / features
+        in_ch = input channels
+        Returns: [M, B, E, out_ch]
+        """
+        # Step 1: Manage interaction among modes
+        M, B, E, C = x_hat.shape
+
+        if self.mode_interaction == 'attention':
+            # Flatten out B,E => shape [M, B*E, in_ch]
+            x_flat = x_hat.reshape(M, B * E, C)  # [M, (B*E), in_ch]
+            attn_out, _ = self.attn(x_flat, x_flat, x_flat)
+            # Optional linear
+            x_flat = self.post_attn_linear(attn_out)
+            # Reshape back
+            x_hat = x_flat.reshape(M, B, E, C)
+
+        elif self.mode_interaction == 'concat':
+            # [M, B, E, in_ch] -> [B, E, M, in_ch]
+            x_perm = x_hat.permute(1, 2, 0, 3)  # [B, E, M, in_ch]
+            B_, E_, M_, C_ = x_perm.shape
+            flattened = x_perm.reshape(B_ * E_, M_ * C_)  # [B*E, M*in_ch]
+            updated = self.mlp(flattened)                 # [B*E, M*in_ch]
+            updated = updated.reshape(B_, E_, M_, C_)     # [B, E, M, in_ch]
+            x_hat = updated.permute(2, 0, 1, 3)           # [M, B, E, in_ch]
+
+        # If 'no_interaction', do nothing special here.
+
+        # Step 2: Original mode-wise linear transform
         # weights1: [M, in_ch, out_ch]
-        out_hat = torch.einsum("mni,mio->mno", x_hat, self.weights1)
+        # x_hat:    [M, B, E, in_ch]
+        out_hat = torch.einsum('mbei,mio->mbeo', x_hat, self.weights1)
         return out_hat
 
 class SpectralConv1dODE(nn.Module):
     def __init__(self, in_ch, out_ch, modes1, solver, rtol, atol, fourier_basis=None, 
-                 no_fourier=False, no_ode=False):
+                 no_fourier=False, no_ode=False, mode_interaction="no_interaction"):
         super(SpectralConv1dODE, self).__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
@@ -160,16 +292,17 @@ class SpectralConv1dODE(nn.Module):
         self.no_fourier = no_fourier
         self.no_ode = no_ode 
         self.modes1 = modes1 
+        self.mode_interaction = mode_interaction 
 
         assert not (no_fourier and no_ode), "no_fourier and no_ode cannot be True at the same time" 
 
         
         if no_fourier is True:
-            self.ode_func = ODEFunction_real(in_ch, out_ch, modes1) 
+            self.ode_func = ODEFunction_real(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction) 
         elif fourier_basis == "linear": 
             self.ode_func = ODEFunction_complex(in_ch, out_ch, modes1)
         elif fourier_basis == "graph":
-            self.ode_func = ODEFunction_real(in_ch, out_ch, modes1) 
+            self.ode_func = ODEFunction_real(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction) 
         else: 
             raise ValueError("fourier_basis must be either 'linear' or 'graph'")
         
@@ -269,10 +402,10 @@ class SpectralConv1dODE(nn.Module):
 
 class TimeConvODE(nn.Module):
     def __init__(self, in_ch, out_ch, modes, act, solver, rtol, atol, fourier_basis=None, 
-                 no_fourier=False, no_ode=False):
+                 no_fourier=False, no_ode=False, mode_interaction="no_interaction"):
         super(TimeConvODE, self).__init__()
         self.t_conv = SpectralConv1dODE(in_ch, out_ch, modes, solver, rtol, atol, fourier_basis, 
-                                        no_fourier=no_fourier, no_ode=no_ode)
+                                        no_fourier=no_fourier, no_ode=no_ode, mode_interaction=mode_interaction)
         self.act = act
 
         self.no_fourier = no_fourier
@@ -311,29 +444,88 @@ class ODEFunction_complex_x(nn.Module):
         return out_ft
 
 class ODEFunction_real_x(nn.Module):
-    def __init__(self, in_ch, out_ch, modes1):
+    def __init__(self, in_ch, out_ch, modes1, mode_interaction='no_interaction', n_heads=1, hidden_dim=128):
+        """
+        ODEFunction_real_x now supports optional mode_interaction:
+            'no_interaction' -> Original scheme (default)
+            'attention'      -> Self-attention across modes
+            'concat'         -> Concatenate all modes into a single vector, feed through MLP
+        """
         super(ODEFunction_real_x, self).__init__()
-        self.in_ch = in_ch  # Input channels (e.g., positions and velocities)
-        self.out_ch = out_ch  # Output channels (should match in_ch)
+        self.in_ch = in_ch
+        self.out_ch = out_ch
         self.modes1 = modes1
-
         self.scale = (1 / (in_ch * out_ch))
+
         # Weights shape: [modes1, in_ch, out_ch]
         self.weights1 = nn.Parameter(
             self.scale * torch.rand(self.modes1, self.in_ch, self.out_ch, dtype=torch.float)
         )
+        self.mode_interaction = mode_interaction
+
+        if self.mode_interaction == 'attention':
+            # We'll flatten [B, E] to treat M as seq_len => x_hat shape [M, B*E, in_ch]
+            self.attn = nn.MultiheadAttention(embed_dim=in_ch, num_heads=n_heads, batch_first=False)
+            self.post_attn_linear = nn.Linear(in_ch, in_ch)
+
+        elif self.mode_interaction == 'concat':
+            # We'll flatten the modes dimension for each [B, E] slice
+            self.mlp = nn.Sequential(
+                nn.Linear(self.modes1 * in_ch, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, self.modes1 * in_ch),
+            )
+
+        elif self.mode_interaction == 'no_interaction':
+            # Default: original scheme
+            pass
+        else:
+            raise ValueError(
+                f"mode_interaction must be one of ['no_interaction', 'attention', 'concat'], got {self.mode_interaction}"
+            )
 
     def forward(self, t, x_hat):
-        # x_hat shape: [M, B, E, in_ch]
-        # weights1 shape: [M, in_ch, out_ch]
-        # Output shape: [M, B, E, out_ch]
+        """
+        x_hat: [M, B, E, in_ch]
+        M = number of modes
+        B = batch size
+        E = extra dimension / features
+        in_ch = input channels
+        Returns: [M, B, E, out_ch]
+        """
+        # Step 1: Manage interaction among modes
+        M, B, E, C = x_hat.shape
+
+        if self.mode_interaction == 'attention':
+            # Flatten out B,E => shape [M, B*E, in_ch]
+            x_flat = x_hat.reshape(M, B * E, C)  # [M, (B*E), in_ch]
+            attn_out, _ = self.attn(x_flat, x_flat, x_flat)
+            # Optional linear
+            x_flat = self.post_attn_linear(attn_out)
+            # Reshape back
+            x_hat = x_flat.reshape(M, B, E, C)
+
+        elif self.mode_interaction == 'concat':
+            # [M, B, E, in_ch] -> [B, E, M, in_ch]
+            x_perm = x_hat.permute(1, 2, 0, 3)  # [B, E, M, in_ch]
+            B_, E_, M_, C_ = x_perm.shape
+            flattened = x_perm.reshape(B_ * E_, M_ * C_)  # [B*E, M*in_ch]
+            updated = self.mlp(flattened)                 # [B*E, M*in_ch]
+            updated = updated.reshape(B_, E_, M_, C_)     # [B, E, M, in_ch]
+            x_hat = updated.permute(2, 0, 1, 3)           # [M, B, E, in_ch]
+
+        # If 'no_interaction', do nothing special here.
+
+        # Step 2: Original mode-wise linear transform
+        # weights1: [M, in_ch, out_ch]
+        # x_hat:    [M, B, E, in_ch]
         out_hat = torch.einsum('mbei,mio->mbeo', x_hat, self.weights1)
         return out_hat
 
 
 class SpectralConv1dODE_x(nn.Module):
     def __init__(self, in_ch, out_ch, modes1, solver, rtol, atol, fourier_basis=None, 
-                 no_fourier=False, no_ode=False):
+                 no_fourier=False, no_ode=False, mode_interaction="no_interaction"):
         super(SpectralConv1dODE_x, self).__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
@@ -346,15 +538,16 @@ class SpectralConv1dODE_x(nn.Module):
         self.no_fourier = no_fourier
         self.no_ode = no_ode
         self.modes1 = modes1 
+        self.mode_interaction = mode_interaction 
 
         assert not (no_fourier and no_ode), "no_fourier and no_ode cannot be True at the same time" 
 
         if no_fourier is True:
-            self.ode_func = ODEFunction_real_x(in_ch, out_ch, modes1) 
+            self.ode_func = ODEFunction_real_x(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction) 
         elif fourier_basis == "linear": 
             self.ode_func = ODEFunction_complex_x(in_ch, out_ch, modes1)
         elif fourier_basis == "graph":
-            self.ode_func = ODEFunction_real_x(in_ch, out_ch, modes1)
+            self.ode_func = ODEFunction_real_x(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction)
         else:
             raise ValueError("fourier_basis must be either 'linear' or 'graph'") 
 
@@ -378,7 +571,7 @@ class SpectralConv1dODE_x(nn.Module):
         if self.no_fourier: 
             assert N == self.modes1, "Number of modes should be equal to N" 
 
-        if self.fourier_basis == "graph": 
+        if self.fourier_basis == "graph":
             gft = GraphFourier(U_batch, B, N, T)
 
         # Compute Fourier coefficients along the spatial dimension
@@ -452,10 +645,10 @@ class SpectralConv1dODE_x(nn.Module):
 
 class TimeConvODE_x(nn.Module):
     def __init__(self, in_ch, out_ch, modes, act, solver, rtol, atol, fourier_basis=None, 
-                 no_fourier=False, no_ode=False):
+                 no_fourier=False, no_ode=False, mode_interaction="no_interaction"):
         super(TimeConvODE_x, self).__init__()
         self.t_conv = SpectralConv1dODE_x(in_ch, out_ch, modes, solver, rtol, atol, fourier_basis, 
-                                          no_fourier=no_fourier, no_ode=no_ode)
+                                          no_fourier=no_fourier, no_ode=no_ode, mode_interaction=mode_interaction)
         self.act = act 
 
         self.no_fourier = no_fourier

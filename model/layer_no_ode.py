@@ -6,6 +6,76 @@ import torch.nn.functional as F
 from torchdiffeq import odeint 
 from torch_geometric.utils import to_dense_adj 
 
+
+def positional_encoding_1d(time, embedding_dim, max_positions=5000):
+    """
+    Standard sinusoidal positional encoding for a single time scalar in [0, 1].
+    Scales `time` by max_positions to mimic discrete index embeddings.
+    Returns a [embedding_dim] vector.
+    """
+    # scale time
+    scaled_time = time * max_positions  
+    half_dim = embedding_dim // 2
+    # define frequency exponents
+    div_term = math.log(max_positions) / (half_dim - 1) if half_dim > 1 else 1.0
+    freq_factors = torch.exp(
+        -div_term * torch.arange(half_dim, dtype=torch.float32, device=time.device)
+    )  # [half_dim]
+    # elementwise multiply & build [sin, cos]
+    angles = scaled_time * freq_factors  # [half_dim]
+    sin_part = torch.sin(angles)
+    cos_part = torch.cos(angles)
+    emb = torch.cat([sin_part, cos_part], dim=-1)  # [embedding_dim <= 2*half_dim]
+    # if embedding_dim is odd, zero-pad
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1), mode='constant')
+    return emb
+
+def rope_encoding_1d(time, embedding_dim, max_positions=5000):
+    """
+    A more typical RoPE implementation for a single time scalar in [0, 1].
+    This version *generates* a 1D embedding by essentially rotating a base sinusoidal 
+    representation within each pair of dimensions.
+
+    In full transformer usage, RoPE is typically applied by *rotating an existing embedding* 
+    rather than generating one from scratch. For demonstration, here we:
+      1. Build the standard sinusoidal encoding: angles = time * freq
+      2. Split those angles into pairs
+      3. For each pair, apply a rotation that yields a (cos θ, sin θ) style embedding.
+
+    Returns:
+        Tensor of shape [embedding_dim].
+    """
+    # 1) Generate the standard sinusoidal angles
+    scaled_time = time * max_positions
+    half_dim = embedding_dim // 2
+    if half_dim < 1:
+        raise ValueError(f"embedding_dim must be >= 2 for RoPE, got {embedding_dim}")
+    div_term = math.log(max_positions) / (half_dim - 1) if half_dim > 1 else 1.0
+    
+    # frequencies
+    freq_factors = torch.exp(
+        -div_term * torch.arange(half_dim, dtype=torch.float32, device=time.device)
+    )  # [half_dim]
+    angles = scaled_time * freq_factors  # [half_dim], each entry is θ_i
+    
+    # 2) For each i, create a 2D rotation of a "base" vector. 
+    #    Usually in practice, you'd rotate an existing pair [x_2i, x_2i+1] by θ_i.
+    #    Here, we just produce [cos(θ_i), sin(θ_i)] for demonstration.
+    cos_theta = torch.cos(angles)  # [half_dim]
+    sin_theta = torch.sin(angles)  # [half_dim]
+
+    # 3) Interleave cos and sin to get final embedding
+    rope_emb = torch.zeros(embedding_dim, device=time.device)
+    rope_emb[0::2] = cos_theta
+    rope_emb[1::2] = sin_theta
+
+    # If embedding_dim is odd, pad last dimension (similar to the positional_encoding_1d approach)
+    if embedding_dim % 2 == 1:
+        rope_emb = F.pad(rope_emb, (0, 1), mode='constant')
+
+    return rope_emb
+
 class GraphFourier(nn.Module): 
     def __init__(self, U_batch, B, N, T): 
         """
@@ -128,12 +198,34 @@ class ODEFunction_complex(nn.Module):
         return out_ft
 
 class ODEFunction_real(nn.Module):
-    def __init__(self, in_ch, out_ch, modes1, mode_interaction='no_interaction', n_heads=1, hidden_dim=128):
+    def __init__(
+        self, 
+        in_ch, 
+        out_ch, 
+        modes1, 
+        mode_interaction='no_interaction', 
+        n_heads=1, 
+        hidden_dim=128,
+        # ---- NEW ARGS ----
+        time_mode='none', 
+        time_embedding_dim=16, 
+        max_positions=5000
+    ):
         """
-        ODEFunction_real now supports optional mode_interaction:
-            'no_interaction' -> Original scheme (default)
-            'attention'      -> Self-attention across modes
-            'concat'         -> Concatenate all modes into a single vector, feed through MLP
+        ODEFunction_real now has optional mode_interaction and optional time_mode:
+            mode_interaction in ['no_interaction', 'attention', 'concat']
+            time_mode in ['none', 'concat', 'mlp', 'posenc', 'rope']
+
+        Args:
+            in_ch: int, input channel dimension
+            out_ch: int, output channel dimension
+            modes1: int, number of modes
+            mode_interaction: str, how to handle mode interaction
+            n_heads: int, number of attention heads if using attention
+            hidden_dim: int, hidden dimension for MLP if using 'concat'
+            time_mode: str, how to incorporate time
+            time_embedding_dim: int, dimension of time embedding if using 'concat', 'mlp', or encodings
+            max_positions: int, used for positional/rope embeddings
         """
         super(ODEFunction_real, self).__init__()
         self.in_ch = in_ch
@@ -141,70 +233,146 @@ class ODEFunction_real(nn.Module):
         self.modes1 = modes1
         self.scale = (1 / (in_ch * out_ch))
 
+        self.mode_interaction = mode_interaction
+        self.time_mode = time_mode
+        self.time_embedding_dim = time_embedding_dim
+        self.max_positions = max_positions
+
+        print(f"time_mode in ODEFunction_real: {self.time_mode}")
+        print(f"mode_interaction in ODEFunction_real: {self.mode_interaction}")
+
+        # Adjust effective input channels if we plan to concat time
+        effective_in_ch = in_ch
+        if self.time_mode != 'none':
+            effective_in_ch += time_embedding_dim
+
         # Original weights for direct mode-wise multiplication
         self.weights1 = nn.Parameter(
-            self.scale * torch.rand(self.modes1, in_ch, out_ch, dtype=torch.float)
+            self.scale * torch.rand(self.modes1, effective_in_ch, out_ch, dtype=torch.float)
         )
-        self.mode_interaction = mode_interaction
 
         # -- Self-Attention if requested --
         if self.mode_interaction == 'attention':
-            # For shape [M, B, in_ch], we interpret M as seq_len, B as batch, in_ch as embed_dim
-            self.attn = nn.MultiheadAttention(embed_dim=in_ch, num_heads=n_heads, batch_first=False)
-            self.post_attn_linear = nn.Linear(in_ch, in_ch)
+            self.attn = nn.MultiheadAttention(embed_dim=effective_in_ch, num_heads=n_heads, batch_first=False)
+            self.post_attn_linear = nn.Linear(effective_in_ch, effective_in_ch)
 
         # -- Concatenate + MLP if requested --
         elif self.mode_interaction == 'concat':
-            # We'll flatten the [M, in_ch] chunk, pass it through MLP, reshape back
             self.mlp = nn.Sequential(
-                nn.Linear(self.modes1 * in_ch, hidden_dim),
+                nn.Linear(self.modes1 * effective_in_ch, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, self.modes1 * in_ch),
+                nn.Linear(hidden_dim, self.modes1 * effective_in_ch),
             )
 
-        elif self.mode_interaction == 'no_interaction':
-            # Default: do nothing special
-            pass
-        else:
-            raise ValueError(
-                f"mode_interaction must be one of ['no_interaction', 'attention', 'concat'], got {self.mode_interaction}"
+        # MLP for time if time_mode == 'mlp'
+        if self.time_mode == 'mlp':
+            self.time_mlp = nn.Sequential(
+                nn.Linear(1, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, time_embedding_dim),
             )
+
+    def _build_time_embedding(self, t, B):
+        """
+        Build a time embedding of dimension self.time_embedding_dim
+        for a scalar t in [0,1], then replicate for batch B.
+        Return shape: [B, time_embedding_dim].
+        """
+        # t is typically a scalar float from odeint
+        # We'll unsqueeze(0) to create a shape [1], convert to a tensor if needed
+        if not torch.is_tensor(t):
+            t_val = torch.tensor([t], dtype=torch.float, device=self.weights1.device)
+        else:
+            t_val = t if t.dim() > 0 else t.unsqueeze(0)
+
+        if self.time_mode == 'none':
+            # no time embedding
+            return None
+
+        elif self.time_mode == 'concat':
+            # Just replicate t as a scalar, or create a [1]-dim MLP?
+            # Here we'll do direct: shape [B, 1]
+            # Then tile to shape [B, time_embedding_dim]
+            # (Though typically you'd want an MLP or embedding.)
+            t_embed = t_val.repeat(B, 1)  # [B, 1]
+            # expand to dimension time_embedding_dim
+            t_embed = t_embed.repeat(1, self.time_embedding_dim)  # [B, time_embedding_dim]
+            return t_embed
+
+        elif self.time_mode == 'mlp':
+            # time_mlp expects shape [B, 1]
+            t_input = t_val.repeat(B).unsqueeze(1)  # [B, 1]
+            t_embed = self.time_mlp(t_input)        # [B, time_embedding_dim]
+            return t_embed
+
+        elif self.time_mode == 'posenc':
+            # build a single [time_embedding_dim] from positional_encoding_1d
+            # then replicate across batch
+            pe = positional_encoding_1d(t_val, self.time_embedding_dim, max_positions=self.max_positions)
+            t_embed = pe.repeat(B, 1)  # [B, time_embedding_dim]
+            return t_embed
+
+        elif self.time_mode == 'rope':
+            # build a single [time_embedding_dim] from rope_encoding_1d
+            # then replicate across batch
+            re = rope_encoding_1d(t_val, self.time_embedding_dim, max_positions=self.max_positions)
+            t_embed = re.repeat(B, 1)  # [B, time_embedding_dim]
+            return t_embed
 
     def forward(self, t, x_hat):
         """
         x_hat: [M, B, in_ch]
         Returns: [M, B, out_ch]
         """
+        # Step 0: Possibly incorporate time
+        M, B, C = x_hat.shape
+
+        if self.time_mode != 'none':
+            # build time embedding
+            t_embed = self._build_time_embedding(t, B)  # [B, time_embedding_dim] or None
+            if t_embed is not None:
+                # expand to [M, B, time_embedding_dim]
+                t_embed_expanded = t_embed.unsqueeze(0).expand(M, -1, -1)
+                # concat along the last dimension
+                x_hat = torch.cat([x_hat, t_embed_expanded], dim=-1)  # [M, B, in_ch + time_embedding_dim]
+
         # Step 1: Manage interaction among modes
         if self.mode_interaction == 'attention':
-            # MultiheadAttention expects shape [seq_len, batch_size, embed_dim]
-            attn_out, _ = self.attn(x_hat, x_hat, x_hat)  # [M, B, in_ch]
-            x_hat = self.post_attn_linear(attn_out)       # [M, B, in_ch]
+            attn_out, _ = self.attn(x_hat, x_hat, x_hat)  # [M, B, effective_in_ch]
+            x_hat = self.post_attn_linear(attn_out)       # [M, B, effective_in_ch]
 
         elif self.mode_interaction == 'concat':
             # Flatten the modes dimension for each batch
-            # x_hat: [M, B, in_ch] -> [B, M, in_ch]
-            x_hat_perm = x_hat.permute(1, 0, 2)  # [B, M, in_ch]
-            B, M, C = x_hat_perm.shape
-            flattened = x_hat_perm.reshape(B, M * C)  # [B, M*in_ch]
-            updated = self.mlp(flattened)             # [B, M*in_ch]
-            # Reshape back
-            updated = updated.reshape(B, M, C)        # [B, M, in_ch]
-            x_hat = updated.permute(1, 0, 2)          # [M, B, in_ch]
-
-        # If 'no_interaction', nothing special is done here, so it remains original x_hat.
+            x_hat_perm = x_hat.permute(1, 0, 2)  # [B, M, effective_in_ch]
+            B_, M_, C_ = x_hat_perm.shape
+            flattened = x_hat_perm.reshape(B_, M_ * C_)  # [B, M*effective_in_ch]
+            updated = self.mlp(flattened)                # [B, M*effective_in_ch]
+            updated = updated.reshape(B_, M_, C_)        # [B, M, effective_in_ch]
+            x_hat = updated.permute(1, 0, 2)             # [M, B, effective_in_ch]
 
         # Step 2: Original mode-wise linear transform
         out_hat = torch.einsum("mni,mio->mno", x_hat, self.weights1)  # [M, B, out_ch]
         return out_hat
 
 class ODEFunction_real_x(nn.Module):
-    def __init__(self, in_ch, out_ch, modes1, mode_interaction='no_interaction', n_heads=1, hidden_dim=128):
+    def __init__(
+        self, 
+        in_ch, 
+        out_ch, 
+        modes1, 
+        mode_interaction='no_interaction', 
+        n_heads=1, 
+        hidden_dim=128,
+        # ---- NEW ARGS ----
+        time_mode='none',
+        time_embedding_dim=16,
+        max_positions=5000
+    ):
         """
-        ODEFunction_real_x now supports optional mode_interaction:
-            'no_interaction' -> Original scheme (default)
-            'attention'      -> Self-attention across modes
-            'concat'         -> Concatenate all modes into a single vector, feed through MLP
+        ODEFunction_real_x now supports optional mode_interaction and time_mode for
+        input shape [M, B, E, in_ch].
+
+        time_mode in ['none', 'concat', 'mlp', 'posenc', 'rope']
         """
         super(ODEFunction_real_x, self).__init__()
         self.in_ch = in_ch
@@ -212,74 +380,121 @@ class ODEFunction_real_x(nn.Module):
         self.modes1 = modes1
         self.scale = (1 / (in_ch * out_ch))
 
-        # Weights shape: [modes1, in_ch, out_ch]
-        self.weights1 = nn.Parameter(
-            self.scale * torch.rand(self.modes1, self.in_ch, self.out_ch, dtype=torch.float)
-        )
         self.mode_interaction = mode_interaction
+        self.time_mode = time_mode
+        self.time_embedding_dim = time_embedding_dim
+        self.max_positions = max_positions
+
+        print(f"time_mode in ODEFunction_real_x: {self.time_mode}")
+        print(f"mode_interaction in ODEFunction_real_x: {self.mode_interaction}")
+
+        # Adjust effective input channels if we plan to concat time
+        effective_in_ch = in_ch
+        if self.time_mode != 'none':
+            effective_in_ch += time_embedding_dim
+
+        # Weights shape: [modes1, effective_in_ch, out_ch]
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(self.modes1, effective_in_ch, self.out_ch, dtype=torch.float)
+        )
 
         if self.mode_interaction == 'attention':
-            # We'll flatten [B, E] to treat M as seq_len => x_hat shape [M, B*E, in_ch]
-            self.attn = nn.MultiheadAttention(embed_dim=in_ch, num_heads=n_heads, batch_first=False)
-            self.post_attn_linear = nn.Linear(in_ch, in_ch)
+            self.attn = nn.MultiheadAttention(embed_dim=effective_in_ch, num_heads=n_heads, batch_first=False)
+            self.post_attn_linear = nn.Linear(effective_in_ch, effective_in_ch)
 
         elif self.mode_interaction == 'concat':
-            # We'll flatten the modes dimension for each [B, E] slice
             self.mlp = nn.Sequential(
-                nn.Linear(self.modes1 * in_ch, hidden_dim),
+                nn.Linear(self.modes1 * effective_in_ch, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, self.modes1 * in_ch),
+                nn.Linear(hidden_dim, self.modes1 * effective_in_ch),
             )
 
-        elif self.mode_interaction == 'no_interaction':
-            # Default: original scheme
-            pass
-        else:
-            raise ValueError(
-                f"mode_interaction must be one of ['no_interaction', 'attention', 'concat'], got {self.mode_interaction}"
+        if self.time_mode == 'mlp':
+            self.time_mlp = nn.Sequential(
+                nn.Linear(1, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, time_embedding_dim),
             )
+
+    def _build_time_embedding(self, t, B):
+        """
+        Create time embedding (similar to ODEFunction_real).
+        Return shape: [B, time_embedding_dim] or None if time_mode='none'.
+        """
+        if not torch.is_tensor(t):
+            t_val = torch.tensor([t], dtype=torch.float, device=self.weights1.device)
+        else:
+            t_val = t if t.dim() > 0 else t.unsqueeze(0)
+
+        if self.time_mode == 'none':
+            return None
+        elif self.time_mode == 'concat':
+            # shape [B, time_embedding_dim]
+            t_embed = t_val.repeat(B, 1)
+            t_embed = t_embed.repeat(1, self.time_embedding_dim)
+            return t_embed
+        elif self.time_mode == 'mlp':
+            t_input = t_val.repeat(B).unsqueeze(1)  # [B, 1]
+            t_embed = self.time_mlp(t_input)        # [B, time_embedding_dim]
+            return t_embed
+        elif self.time_mode == 'posenc':
+            pe = positional_encoding_1d(t_val, self.time_embedding_dim, max_positions=self.max_positions)
+            t_embed = pe.repeat(B, 1)
+            return t_embed
+        elif self.time_mode == 'rope':
+            re = rope_encoding_1d(t_val, self.time_embedding_dim, max_positions=self.max_positions)
+            t_embed = re.repeat(B, 1)
+            return t_embed
 
     def forward(self, t, x_hat):
         """
         x_hat: [M, B, E, in_ch]
-        M = number of modes
-        B = batch size
-        E = extra dimension / features
-        in_ch = input channels
         Returns: [M, B, E, out_ch]
         """
-        # Step 1: Manage interaction among modes
         M, B, E, C = x_hat.shape
 
+        # Step 0: Possibly incorporate time
+        if self.time_mode != 'none':
+            t_embed = self._build_time_embedding(t, B)  # [B, time_embedding_dim] or None
+            if t_embed is not None:
+                # We want to concat along last dimension => shape [M, B, E, in_ch + time_embedding_dim]
+                # First, replicate t_embed across M, E
+                # t_embed: [B, time_embedding_dim]
+                # expand to [M, B, E, time_embedding_dim]
+                t_embed_expanded = t_embed.unsqueeze(0).unsqueeze(2).expand(M, -1, E, -1)
+                x_hat = torch.cat([x_hat, t_embed_expanded], dim=-1)
+
+        # Step 1: Manage interaction among modes
         if self.mode_interaction == 'attention':
-            # Flatten out B,E => shape [M, B*E, in_ch]
-            x_flat = x_hat.reshape(M, B * E, C)  # [M, (B*E), in_ch]
-            attn_out, _ = self.attn(x_flat, x_flat, x_flat)
-            # Optional linear
+            # Flatten out B,E => shape [M, B*E, effective_in_ch]
+            M_, BE_, C_ = M, B * E, x_hat.shape[-1]
+            x_flat = x_hat.reshape(M_, BE_, C_)
+            attn_out, _ = self.attn(x_flat, x_flat, x_flat)  # [M, B*E, effective_in_ch]
             x_flat = self.post_attn_linear(attn_out)
-            # Reshape back
-            x_hat = x_flat.reshape(M, B, E, C)
+            x_hat = x_flat.reshape(M, B, E, C_)
 
         elif self.mode_interaction == 'concat':
-            # [M, B, E, in_ch] -> [B, E, M, in_ch]
-            x_perm = x_hat.permute(1, 2, 0, 3)  # [B, E, M, in_ch]
+            # [M, B, E, effective_in_ch] -> [B, E, M, effective_in_ch]
+            x_perm = x_hat.permute(1, 2, 0, 3)  
             B_, E_, M_, C_ = x_perm.shape
-            flattened = x_perm.reshape(B_ * E_, M_ * C_)  # [B*E, M*in_ch]
-            updated = self.mlp(flattened)                 # [B*E, M*in_ch]
-            updated = updated.reshape(B_, E_, M_, C_)     # [B, E, M, in_ch]
-            x_hat = updated.permute(2, 0, 1, 3)           # [M, B, E, in_ch]
-
-        # If 'no_interaction', do nothing special here.
+            flattened = x_perm.reshape(B_ * E_, M_ * C_)     # [B*E, M*effective_in_ch]
+            updated = self.mlp(flattened)                    # [B*E, M*effective_in_ch]
+            updated = updated.reshape(B_, E_, M_, C_)        # [B, E, M, effective_in_ch]
+            x_hat = updated.permute(2, 0, 1, 3)              # [M, B, E, effective_in_ch]
 
         # Step 2: Original mode-wise linear transform
-        # weights1: [M, in_ch, out_ch]
-        # x_hat:    [M, B, E, in_ch]
+        # weights1: [M, effective_in_ch, out_ch]
         out_hat = torch.einsum('mbei,mio->mbeo', x_hat, self.weights1)
         return out_hat
 
 class SpectralConv1dODE(nn.Module):
     def __init__(self, in_ch, out_ch, modes1, solver, rtol, atol, fourier_basis=None, 
-                 no_fourier=False, no_ode=False, mode_interaction="no_interaction"):
+                 no_fourier=False, no_ode=False, mode_interaction="no_interaction",
+                 time_mode='none',
+                 time_embedding_dim=16,
+                 max_positions=5000):
+
+
         super(SpectralConv1dODE, self).__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
@@ -294,15 +509,19 @@ class SpectralConv1dODE(nn.Module):
         self.modes1 = modes1 
         self.mode_interaction = mode_interaction 
 
+        self.time_mode = time_mode
+        self.time_embedding_dim = time_embedding_dim
+        self.max_positions = max_positions
+
         assert not (no_fourier and no_ode), "no_fourier and no_ode cannot be True at the same time" 
 
         
         if no_fourier is True:
-            self.ode_func = ODEFunction_real(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction) 
+            self.ode_func = ODEFunction_real(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction, time_mode=self.time_mode, time_embedding_dim=self.time_embedding_dim, max_positions=self.max_positions) 
         elif fourier_basis == "linear": 
             self.ode_func = ODEFunction_complex(in_ch, out_ch, modes1)
         elif fourier_basis == "graph":
-            self.ode_func = ODEFunction_real(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction) 
+            self.ode_func = ODEFunction_real(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction, time_mode=self.time_mode, time_embedding_dim=self.time_embedding_dim, max_positions=self.max_positions) 
         else: 
             raise ValueError("fourier_basis must be either 'linear' or 'graph'")
         
@@ -402,14 +621,21 @@ class SpectralConv1dODE(nn.Module):
 
 class TimeConvODE(nn.Module):
     def __init__(self, in_ch, out_ch, modes, act, solver, rtol, atol, fourier_basis=None, 
-                 no_fourier=False, no_ode=False, mode_interaction="no_interaction"):
+                 no_fourier=False, no_ode=False, mode_interaction="no_interaction",
+                 time_mode='none',
+                 time_embedding_dim=16,
+                 max_positions=5000):
         super(TimeConvODE, self).__init__()
         self.t_conv = SpectralConv1dODE(in_ch, out_ch, modes, solver, rtol, atol, fourier_basis, 
-                                        no_fourier=no_fourier, no_ode=no_ode, mode_interaction=mode_interaction)
+                                        no_fourier=no_fourier, no_ode=no_ode, mode_interaction=mode_interaction, 
+                                        time_mode=time_mode, time_embedding_dim=time_embedding_dim, max_positions=max_positions)
         self.act = act
 
         self.no_fourier = no_fourier
         self.no_ode = no_ode
+        self.time_mode = time_mode
+        self.time_embedding_dim = time_embedding_dim
+        self.max_positions = max_positions
 
     def forward(self, x, times, U_batch=None):
         h = self.t_conv(x, times, U_batch)
@@ -418,6 +644,8 @@ class TimeConvODE(nn.Module):
         # add one more dimension to the tensor to make it [B, N, T, E] 
         x = x.unsqueeze(0) # [B, N, 1, E] 
         return x + out
+    
+
     
 
 @torch.jit.script
@@ -443,89 +671,13 @@ class ODEFunction_complex_x(nn.Module):
         out_ft = compl_mul1d_x(x_ft, torch.view_as_complex(self.weights1))
         return out_ft
 
-class ODEFunction_real_x(nn.Module):
-    def __init__(self, in_ch, out_ch, modes1, mode_interaction='no_interaction', n_heads=1, hidden_dim=128):
-        """
-        ODEFunction_real_x now supports optional mode_interaction:
-            'no_interaction' -> Original scheme (default)
-            'attention'      -> Self-attention across modes
-            'concat'         -> Concatenate all modes into a single vector, feed through MLP
-        """
-        super(ODEFunction_real_x, self).__init__()
-        self.in_ch = in_ch
-        self.out_ch = out_ch
-        self.modes1 = modes1
-        self.scale = (1 / (in_ch * out_ch))
-
-        # Weights shape: [modes1, in_ch, out_ch]
-        self.weights1 = nn.Parameter(
-            self.scale * torch.rand(self.modes1, self.in_ch, self.out_ch, dtype=torch.float)
-        )
-        self.mode_interaction = mode_interaction
-
-        if self.mode_interaction == 'attention':
-            # We'll flatten [B, E] to treat M as seq_len => x_hat shape [M, B*E, in_ch]
-            self.attn = nn.MultiheadAttention(embed_dim=in_ch, num_heads=n_heads, batch_first=False)
-            self.post_attn_linear = nn.Linear(in_ch, in_ch)
-
-        elif self.mode_interaction == 'concat':
-            # We'll flatten the modes dimension for each [B, E] slice
-            self.mlp = nn.Sequential(
-                nn.Linear(self.modes1 * in_ch, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, self.modes1 * in_ch),
-            )
-
-        elif self.mode_interaction == 'no_interaction':
-            # Default: original scheme
-            pass
-        else:
-            raise ValueError(
-                f"mode_interaction must be one of ['no_interaction', 'attention', 'concat'], got {self.mode_interaction}"
-            )
-
-    def forward(self, t, x_hat):
-        """
-        x_hat: [M, B, E, in_ch]
-        M = number of modes
-        B = batch size
-        E = extra dimension / features
-        in_ch = input channels
-        Returns: [M, B, E, out_ch]
-        """
-        # Step 1: Manage interaction among modes
-        M, B, E, C = x_hat.shape
-
-        if self.mode_interaction == 'attention':
-            # Flatten out B,E => shape [M, B*E, in_ch]
-            x_flat = x_hat.reshape(M, B * E, C)  # [M, (B*E), in_ch]
-            attn_out, _ = self.attn(x_flat, x_flat, x_flat)
-            # Optional linear
-            x_flat = self.post_attn_linear(attn_out)
-            # Reshape back
-            x_hat = x_flat.reshape(M, B, E, C)
-
-        elif self.mode_interaction == 'concat':
-            # [M, B, E, in_ch] -> [B, E, M, in_ch]
-            x_perm = x_hat.permute(1, 2, 0, 3)  # [B, E, M, in_ch]
-            B_, E_, M_, C_ = x_perm.shape
-            flattened = x_perm.reshape(B_ * E_, M_ * C_)  # [B*E, M*in_ch]
-            updated = self.mlp(flattened)                 # [B*E, M*in_ch]
-            updated = updated.reshape(B_, E_, M_, C_)     # [B, E, M, in_ch]
-            x_hat = updated.permute(2, 0, 1, 3)           # [M, B, E, in_ch]
-
-        # If 'no_interaction', do nothing special here.
-
-        # Step 2: Original mode-wise linear transform
-        # weights1: [M, in_ch, out_ch]
-        # x_hat:    [M, B, E, in_ch]
-        out_hat = torch.einsum('mbei,mio->mbeo', x_hat, self.weights1)
-        return out_hat
-
 
 class SpectralConv1dODE_x(nn.Module):
     def __init__(self, in_ch, out_ch, modes1, solver, rtol, atol, fourier_basis=None, 
-                 no_fourier=False, no_ode=False, mode_interaction="no_interaction"):
+                 no_fourier=False, no_ode=False, mode_interaction="no_interaction",
+                 time_mode='none',
+                 time_embedding_dim=16,
+                 max_positions=5000):
         super(SpectralConv1dODE_x, self).__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
@@ -539,15 +691,18 @@ class SpectralConv1dODE_x(nn.Module):
         self.no_ode = no_ode
         self.modes1 = modes1 
         self.mode_interaction = mode_interaction 
+        self.time_mode = time_mode
+        self.time_embedding_dim = time_embedding_dim
+        self.max_positions = max_positions
 
         assert not (no_fourier and no_ode), "no_fourier and no_ode cannot be True at the same time" 
 
         if no_fourier is True:
-            self.ode_func = ODEFunction_real_x(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction) 
+            self.ode_func = ODEFunction_real_x(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction, time_mode=self.time_mode, time_embedding_dim=self.time_embedding_dim, max_positions=self.max_positions) 
         elif fourier_basis == "linear": 
             self.ode_func = ODEFunction_complex_x(in_ch, out_ch, modes1)
         elif fourier_basis == "graph":
-            self.ode_func = ODEFunction_real_x(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction)
+            self.ode_func = ODEFunction_real_x(in_ch, out_ch, modes1, mode_interaction=self.mode_interaction, time_mode=self.time_mode, time_embedding_dim=self.time_embedding_dim, max_positions=self.max_positions)
         else:
             raise ValueError("fourier_basis must be either 'linear' or 'graph'") 
 
@@ -645,14 +800,21 @@ class SpectralConv1dODE_x(nn.Module):
 
 class TimeConvODE_x(nn.Module):
     def __init__(self, in_ch, out_ch, modes, act, solver, rtol, atol, fourier_basis=None, 
-                 no_fourier=False, no_ode=False, mode_interaction="no_interaction"):
+                 no_fourier=False, no_ode=False, mode_interaction="no_interaction",
+                 time_mode='none',
+                 time_embedding_dim=16,
+                 max_positions=5000):
         super(TimeConvODE_x, self).__init__()
         self.t_conv = SpectralConv1dODE_x(in_ch, out_ch, modes, solver, rtol, atol, fourier_basis, 
-                                          no_fourier=no_fourier, no_ode=no_ode, mode_interaction=mode_interaction)
+                                          no_fourier=no_fourier, no_ode=no_ode, mode_interaction=mode_interaction, 
+                                          time_mode=time_mode, time_embedding_dim=time_embedding_dim, max_positions=max_positions)
         self.act = act 
 
         self.no_fourier = no_fourier
         self.no_ode = no_ode 
+        self.time_mode = time_mode
+        self.time_embedding_dim = time_embedding_dim
+        self.max_positions = max_positions
 
     def forward(self, x, times, U_batch=None):
         h = self.t_conv(x, times, U_batch)

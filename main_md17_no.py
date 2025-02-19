@@ -97,9 +97,15 @@ parser.add_argument('--use_vae', action='store_true', default=False, help='Use V
 # 1. Added kl_weight argument
 parser.add_argument('--kl_weight', type=float, default=1.0, help='Weight for the KL divergence term in VAE loss')
 
-# New argument for mode_interaction
+# 2. New argument for mode_interaction
 parser.add_argument('--mode_interaction', type=str, default='no_interaction',
                     help="Choose among: 'no_interaction', 'attention', 'concat' for the ODEFunction_real/_x.")
+
+# 3. New argument for time_mode
+parser.add_argument('--time_mode', type=str, default='none',
+                    help="One of ['none', 'concat', 'mlp', 'posenc', 'rope'] for time embedding in the ODE solver.")
+
+# time_emb_dim is shared by the ode solver and the decoder, see above 
 
 args = parser.parse_args()
 if args.config_by_file:
@@ -242,7 +248,8 @@ def main():
             no_fourier=args.no_fourier,
             use_vae=args.use_vae,
             gnn_ablation_mode=args.gnn_ablation_mode,
-            mode_interaction=args.mode_interaction
+            mode_interaction=args.mode_interaction,
+            time_mode=args.time_mode
         )
     else:
         raise Exception("Wrong model specified")

@@ -30,5 +30,6 @@
         "kl_weight": 1.0, 
         "use_vae": false, 
         "gnn_ablation_mode": "egnn", 
-        "mode_interaction": "no_interaction" 
+        "mode_interaction": "no_interaction", 
+        "time_mode": "none"
 }

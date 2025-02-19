@@ -378,7 +378,7 @@ class SpectralConv1dODE_x(nn.Module):
         if self.no_fourier: 
             assert N == self.modes1, "Number of modes should be equal to N" 
 
-        if self.fourier_basis == "graph": 
+        if self.fourier_basis == "graph":
             gft = GraphFourier(U_batch, B, N, T)
 
         # Compute Fourier coefficients along the spatial dimension
@@ -468,5 +468,85 @@ class TimeConvODE_x(nn.Module):
         # add one more dimension to the tensor to make it align with [B, N, T, E, 2] 
         x = x.unsqueeze(0) # [B, N, 1, E, 2] 
         return x + out
+
+class GNNODEFunction(nn.Module):
+    """
+    Defines dX/dt = f(X), where X could be node embeddings (and possibly positions).
+    We do not incorporate 't' explicitly here, but you could if needed.
+    """
+    def __init__(self, gnn_layer):
+        """
+        gnn_layer: a single GNN layer or a small stack of layers 
+                   that process (positions, node_feats, edge_index, edge_feats, velocities).
+                   For demonstration, we'll pass dummy placeholders in some arguments.
+        """
+        super(GNNODEFunction, self).__init__()
+        self.gnn_layer = gnn_layer
+
+    def forward(self, t, x):
+        """
+        x shape: [num_nodes, feat_dim]
+        We'll treat x as 'h' (node features) in the GNN. 
+        The GNN typically expects (x, h, edge_index, edge_fea, v). We'll pass x for h 
+        and placeholders for the others as needed.
+        """
+        num_nodes, feat_dim = x.shape
+
+        # We pass dummy placeholders for positions and velocities if our GNN layer requires them.
+        dummy_positions = torch.zeros(num_nodes, 3, device=x.device)
+        dummy_velocities = torch.zeros(num_nodes, 3, device=x.device)
+
+        # In some GNNs, the forward signature might be: 
+        #   layer(x, h, edge_index, edge_fea, v)
+        # We treat x as h, and we must have edge_index & edge_fea as part of the instance.
+        # This example omits them; see GraphODEBlock below for how they are passed in.
+        # Here, we'll assume the single-layer can handle stored edge info.
+        x_next, _, h_next = self.gnn_layer(
+            dummy_positions, x, 
+            self.edge_index, self.edge_fea, 
+            v=dummy_velocities
+        )
+        # x_next or h_next might contain the new features. 
+        # You can adapt this depending on your GNN layer's return signature.
+        return h_next
+
+
+class GraphODEBlock(nn.Module):
+    """
+    Wraps the GNNODEFunction with an ODE solver call. 
+    Before calling odeint, you set up the edge_index, edge_fea, etc.
+    """
+    def __init__(self, gnn_layer, solver='dopri5', rtol=1e-3, atol=1e-4):
+        super(GraphODEBlock, self).__init__()
+        self.ode_func = GNNODEFunction(gnn_layer=gnn_layer)
+        self.solver = solver
+        self.rtol = rtol
+        self.atol = atol
+
+    def set_graph(self, edge_index, edge_fea):
+        """
+        Provide the graph structure to the ODE function prior to integration.
+        """
+        self.ode_func.edge_index = edge_index
+        self.ode_func.edge_fea = edge_fea
+
+    def forward(self, x0, t_span):
+        """
+        x0: shape [num_nodes, feat_dim] - initial node features
+        t_span: 1D or 2D times. For simplicity, we assume 1D, e.g. torch.linspace(0, 1, steps=8).
+        Returns:
+            x_t: [len(t_span), num_nodes, feat_dim], solved states.
+        """
+        # Solve ODE: dx/dt = f(x)
+        trajectory = odeint(
+            self.ode_func, 
+            x0,
+            t_span,
+            method=self.solver,
+            rtol=self.rtol,
+            atol=self.atol
+        )  
+        # trajectory shape: [len(t_span), num_nodes, feat_dim]
+        return trajectory
 
 

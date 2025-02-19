@@ -7,7 +7,7 @@
         "seed": 1,
         "lr": 0.0001,
         "nf": 64,
-        "model": "fourier",
+        "model": "graph_ode",
         "attention": 0,
         "n_layers": 5,
         "max_training_samples": 500,
@@ -28,6 +28,6 @@
         "no_fourier": false,
         "no_ode": false, 
         "kl_weight": 1.0, 
-        "use_vae": false, 
+        "use_vae": true, 
         "gnn_ablation_mode": "egnn"
 }

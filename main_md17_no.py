@@ -36,7 +36,7 @@ parser.add_argument('--lr', type=float, default=5e-4, metavar='N',
 parser.add_argument('--nf', type=int, default=64, metavar='N',
                     help='hidden dim')
 parser.add_argument('--model', type=str, default='FourierMD', metavar='N',
-                    help='available models: FourierMD')
+                    help='available models: FourierMD, fourier, graph_ode, etc.')
 parser.add_argument('--attention', type=int, default=0, metavar='N',
                     help='attention in the ae model')
 parser.add_argument('--n_layers', type=int, default=5, metavar='N',
@@ -214,7 +214,8 @@ def main():
         assert dataset_train.n_node == args.num_modes, "Number of modes must be the same as the number of atoms" 
         assert args.fourier_basis == None, "No Fourier block, so fourier_basis must be None" 
 
-    if args.model == 'fourier': 
+    if args.model == 'fourier':
+        raise NotImplementedError("FourierMD is not implemented") 
         model = FourierMD(n_layers=args.n_layers, in_node_nf=2, in_edge_nf=2 + 3, hidden_nf=args.nf, device=device,
                           with_v=True, flat=args.flat, activation=nn.SiLU(), norm=args.norm, num_modes=args.num_modes,
                           num_timesteps=args.num_timesteps, time_emb_dim=args.time_emb_dim, 
@@ -222,9 +223,31 @@ def main():
                           delta_frame=delta_frame, fourier_basis=args.fourier_basis, 
                           no_ode=args.no_ode, no_fourier=args.no_fourier, use_vae=args.use_vae, 
                           gnn_ablation_mode=args.gnn_ablation_mode)
+    elif args.model == 'graph_ode':
+        from model.fourier_md import GraphODEMD
+        model = GraphODEMD(
+            n_layers=args.n_layers,
+            in_node_nf=2,
+            in_edge_nf=2 + 3,
+            hidden_nf=args.nf,
+            activation=nn.SiLU(),
+            device=device,
+            with_v=True,
+            flat=args.flat,
+            norm=args.norm,
+            num_timesteps=args.num_timesteps,
+            num_atoms=None,   # to be discovered from data
+            solver=args.solver,
+            rtol=args.rtol,
+            atol=args.atol,
+            delta_frame=args.delta_frame,
+            use_vae=args.use_vae,
+            gnn_ablation_mode=args.gnn_ablation_mode
+        )
     else:
         raise Exception("Wrong model specified")
 
+    model.to(device)
     print(model)
 
     model_save_path = args.outf + '/' + args.exp_name + '/' + 'saved_model.pth'
@@ -302,6 +325,7 @@ def train(model, optimizer, epoch, loader, backprop=True):
         optimizer.zero_grad()
 
         if args.model == 'fourier':
+            raise NotImplementedError("FourierMD is not implemented")  
             nodes = torch.sqrt(torch.sum(vel ** 2, dim=1)).unsqueeze(1).detach()
             nodes = torch.cat((nodes, Z / Z.max()), dim=-1)
             rows, cols = edges
@@ -317,6 +341,18 @@ def train(model, optimizer, epoch, loader, backprop=True):
                                               timeframes=timeframes,
                                               U_batch=U_batch)
                 kld_loss = torch.tensor(0.0, device=device)  # Ensure kld_loss is defined
+        elif args.model == 'graph_ode':
+            nodes = torch.sqrt(torch.sum(vel ** 2, dim=1)).unsqueeze(1).detach()
+            nodes = torch.cat((nodes, Z / Z.max()), dim=-1)
+            rows, cols = edges
+            loc_dist = torch.sum((loc[rows] - loc[cols])**2, 1).unsqueeze(1)  # relative distances among locations
+            edge_attr = torch.cat([edge_attr, loc_dist], 1).detach()  # concatenate all edge properties
+            loc_mean = loc.view(batch_size, n_nodes, 3).mean(dim=1, keepdim=True).repeat(1, n_nodes, 1).view(-1, 3)  # [BN, 3]
+
+            assert args.use_vae == True, "VAE must be used for graph_ode" 
+
+            loc_pred, vel_pred, _, kld_loss = model(loc.detach(), nodes, edges, edge_attr, vel, loc_mean=loc_mean,
+                                                  timeframes=timeframes)
         else:
             raise Exception("Wrong model")
 

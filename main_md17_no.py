@@ -107,6 +107,11 @@ parser.add_argument('--time_mode', type=str, default='none',
 
 # time_emb_dim is shared by the ode solver and the decoder, see above 
 
+parser.add_argument('--propagate_x', type=eval, default=True,
+                    help='If True, propagate the positions x in ODE, else skip.')
+parser.add_argument('--propagate_h', type=eval, default=True,
+                    help='If True, propagate the hidden features h in ODE, else skip.')
+
 args = parser.parse_args()
 if args.config_by_file:
     job_param_path = 'configs/' + args.config
@@ -249,7 +254,9 @@ def main():
             use_vae=args.use_vae,
             gnn_ablation_mode=args.gnn_ablation_mode,
             mode_interaction=args.mode_interaction,
-            time_mode=args.time_mode
+            time_mode=args.time_mode,
+            propagate_x=args.propagate_x,
+            propagate_h=args.propagate_h
         )
     else:
         raise Exception("Wrong model specified")

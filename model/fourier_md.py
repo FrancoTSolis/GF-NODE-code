@@ -17,7 +17,9 @@ class FourierMD(nn.Module):
                  use_vae=False,
                  gnn_ablation_mode='EGNN',
                  mode_interaction='no_interaction',
-                 time_mode='none'):  
+                 time_mode='none',
+                 propagate_x=True,
+                 propagate_h=True):  
         super(FourierMD, self).__init__()
         self.encode_layers = nn.ModuleList() 
         self.decode_layers = nn.ModuleList() 
@@ -47,6 +49,10 @@ class FourierMD(nn.Module):
         self.gnn_ablation_mode = gnn_ablation_mode  # store the chosen ablation mode
         self.mode_interaction = mode_interaction
         self.time_mode = time_mode
+
+        # 2) New ablation flags
+        self.propagate_x = propagate_x
+        self.propagate_h = propagate_h
 
         # input feature mapping 
         self.embedding = nn.Linear(in_node_nf, self.encode_hidden_nf)
@@ -153,14 +159,30 @@ class FourierMD(nn.Module):
         # normalize the timeframes to (0, 1], important for numerical stability of ode solver
         normalized_timeframes = timeframes / self.delta_frame 
 
-        h = self.freq_conv(h.view((B, N, -1)), normalized_timeframes, U_batch) # [T, B, N, E]
+        # 3) Conditionally propagate h
+        if self.propagate_h:
+            # Original route: ODE for h
+            h = self.freq_conv(h.view((B, N, -1)), normalized_timeframes, U_batch) # shape [T, B, N, E]
+        else:
+            # Skip freq_conv, replicate h along time dimension to keep shape
+            h = h.view(B, N, -1)  # [B, N, E]
+            h = h.unsqueeze(0).repeat(T, 1, 1, 1)  # => [T, B, N, E]
 
+        # 4) Conditionally propagate x
         x_translated = x - loc_mean
-        X = torch.stack((x_translated, v), dim=-1)
-        temp = self.freq_conv_x(X.view(B, N, 3, 2), normalized_timeframes, U_batch) # [T, B, N, 3, 2] 
-        loc_mean = loc_mean.repeat(T, 1) 
-        x = temp[..., 0].contiguous().view(T * num_nodes, 3) + loc_mean
-        v = temp[..., 1].contiguous().view(T * num_nodes, 3)
+        if self.propagate_x:
+            X = torch.stack((x_translated, v), dim=-1)  # [BN, 3, 2]
+            X = X.view(B, N, 3, 2)
+            temp = self.freq_conv_x(X, normalized_timeframes, U_batch) # [T, B, N, 3, 2] 
+            loc_mean_expanded = loc_mean.repeat(T, 1) 
+            x = temp[..., 0].contiguous().view(T * num_nodes, 3) + loc_mean_expanded
+            v = temp[..., 1].contiguous().view(T * num_nodes, 3)
+        else:
+            # Skip freq_conv_x, replicate x and v along time dimension
+            x = x.unsqueeze(0).repeat(T, 1, 1)  # => [T, BN, 3]
+            x = x.contiguous().view(T * num_nodes, 3)
+            v = v.unsqueeze(0).repeat(T, 1, 1)  # => [T, BN, 3]
+            v = v.contiguous().view(T * num_nodes, 3)
 
         # Adjust time embeddings
         time_emb = get_timestep_embedding(

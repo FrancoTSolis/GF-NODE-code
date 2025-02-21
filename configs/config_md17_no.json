@@ -31,5 +31,7 @@
         "use_vae": false, 
         "gnn_ablation_mode": "egnn", 
         "mode_interaction": "no_interaction", 
-        "time_mode": "none"
+        "time_mode": "none", 
+        "propagate_x": true,
+        "propagate_h": true
 }

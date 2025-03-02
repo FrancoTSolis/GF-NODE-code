@@ -102,7 +102,7 @@ class MD17DynamicsDataset(MD17Dataset):
 
     """
     def __init__(self, partition, max_samples, delta_frame, data_dir, molecule_type, num_timesteps=8, 
-                 uneven_sampling=False, internal_seed=None):
+                 uneven_sampling=False, internal_seed=None, time_ref=None):
         # setup a split, tentative setting
         train_par, val_par, test_par = 0.1, 0.05, 0.05
         full_dir = os.path.join(data_dir, 'md17_' + molecule_type + '.npz')
@@ -114,6 +114,7 @@ class MD17DynamicsDataset(MD17Dataset):
         self.delta_frame = delta_frame 
         self.num_timesteps = num_timesteps 
         self.uneven_sampling = uneven_sampling # if True, sample timesteps unevenly
+        self.time_ref = time_ref  # store the training delta_frame if provided
         if self.uneven_sampling: 
             self.internal_seed = internal_seed # seed for the random generator 
             self.random_state = np.random.RandomState(self.internal_seed)
@@ -302,7 +303,7 @@ class MD17DynamicsDataset(MD17Dataset):
 
 if __name__ == "__main__":
     # load the dataset, and visualize the magnitude of the positions and velocities 
-    dataset = MD17DynamicsDataset(partition='train', max_samples=500, delta_frame=3000, molecule_type='benzene_old', data_dir='md17', num_timesteps=8, uneven_sampling=False, internal_seed=None)
+    dataset = MD17DynamicsDataset(partition='train', max_samples=500, delta_frame=3000, molecule_type='benzene_old', data_dir='md17', num_timesteps=8, uneven_sampling=False, internal_seed=None, time_ref=3000)
     # visualize the magnitude of the positions and velocities
     x_0 = dataset.x_0.numpy()
     v_0 = dataset.v_0.numpy()

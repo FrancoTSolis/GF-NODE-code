@@ -34,7 +34,8 @@ class AlanineDataset:
     """
     def __init__(self, partition, max_samples, delta_frame, data_dir, molecule_type, 
                  num_timesteps=8, uneven_sampling=False, internal_seed=None,
-                 scale=False, distinguish=False):
+                 scale=False, distinguish=False,
+                 time_ref=None):
         """
         Args:
             partition (str): 'train', 'val', or 'test'
@@ -46,9 +47,11 @@ class AlanineDataset:
             internal_seed (int): Random seed for uneven sampling
             scale (bool): Whether to scale coordinates
             distinguish (bool): Whether to distinguish atom types
+            time_ref (int): Training delta frame for time normalization
         """
 
         assert molecule_type == 'ala2', "Molecule type must be 'ala2'" 
+        self.time_ref = time_ref  # store training delta frame for time normalization
         # Setup split ratios
         train_par, val_par, test_par = 0.8, 0.1, 0.1
         self.partition = partition

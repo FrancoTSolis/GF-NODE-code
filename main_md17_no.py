@@ -50,7 +50,9 @@ parser.add_argument('--norm_diff', type=eval, default=False, metavar='N',
 parser.add_argument('--tanh', type=eval, default=False, metavar='N',
                     help='use tanh')
 parser.add_argument('--delta_frame', type=int, default=50,
-                    help='Number of frames delta.')
+                    help='Number of frames delta for training.')
+parser.add_argument('--delta_frame_eval', type=int, default=None,
+                    help='Number of frames delta for validation/testing (up-sampling mode).')
 parser.add_argument('--mol', type=str, default='aspirin',
                     help='Name of the molecule.')
 parser.add_argument('--data_dir', type=str, default='',
@@ -132,6 +134,10 @@ elif args.mol in ["aspirin", "benzene_old", "ethanol", "malonaldehyde", "naphtha
 else: 
     raise ValueError(f"Molecule {args.mol} not supported") 
 
+# Set up train vs eval delta_frame
+train_delta_frame = args.delta_frame
+eval_delta_frame = args.delta_frame_eval if (args.delta_frame_eval is not None) else train_delta_frame
+
 
 device = torch.device("cuda" if args.cuda else "cpu")
 loss_mse = nn.MSELoss(reduction='none')
@@ -202,28 +208,53 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    dataset_train = MoleculeDynamicsDataset(partition='train', max_samples=args.max_training_samples, data_dir=args.data_dir,
-                                            molecule_type=args.mol, delta_frame=args.delta_frame,
-                                            num_timesteps=args.num_timesteps, 
-                                            uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
-    loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True, drop_last=True,
-                                               num_workers=0)
+    # Training dataset: use training delta_frame
+    dataset_train = MoleculeDynamicsDataset(
+        partition='train',
+        max_samples=args.max_training_samples,
+        data_dir=args.data_dir,
+        molecule_type=args.mol,
+        delta_frame=train_delta_frame,
+        num_timesteps=args.num_timesteps, 
+        uneven_sampling=args.uneven_sampling,
+        internal_seed=args.internal_seed,
+        time_ref=train_delta_frame  # <--- pass training delta_frame for time normalization
+    )
+    loader_train = torch.utils.data.DataLoader(
+        dataset_train, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=0
+    )
 
-    dataset_val = MoleculeDynamicsDataset(partition='val', max_samples=2000, data_dir=args.data_dir,
-                                          molecule_type=args.mol, delta_frame=args.delta_frame,
-                                          num_timesteps=args.num_timesteps, 
-                                          uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
-    loader_val = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size, shuffle=False, drop_last=False,
-                                             num_workers=0)
+    # Validation dataset: use smaller (eval) delta_frame but still normalize times by training frame
+    dataset_val = MoleculeDynamicsDataset(
+        partition='val',
+        max_samples=2000,
+        data_dir=args.data_dir,
+        molecule_type=args.mol,
+        delta_frame=eval_delta_frame,
+        num_timesteps=args.num_timesteps,
+        uneven_sampling=args.uneven_sampling,
+        internal_seed=args.internal_seed,
+        time_ref=train_delta_frame  # <--- normalizing times by the train delta frame
+    )
+    loader_val = torch.utils.data.DataLoader(
+        dataset_val, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=0
+    )
 
-    dataset_test = MoleculeDynamicsDataset(partition='test', max_samples=2000, data_dir=args.data_dir,
-                                           molecule_type=args.mol, delta_frame=args.delta_frame,
-                                           num_timesteps=args.num_timesteps, 
-                                           uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
-    loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=args.batch_size, shuffle=False, drop_last=False,
-                                              num_workers=0)
-
-    delta_frame = args.delta_frame
+    # Test dataset: same approach
+    dataset_test = MoleculeDynamicsDataset(
+        partition='test',
+        max_samples=2000,
+        data_dir=args.data_dir,
+        molecule_type=args.mol,
+        delta_frame=eval_delta_frame,
+        num_timesteps=args.num_timesteps,
+        uneven_sampling=args.uneven_sampling,
+        internal_seed=args.internal_seed,
+        time_ref=train_delta_frame  # <--- normalizing times by the train delta frame
+    )
+    loader_test = torch.utils.data.DataLoader(
+        dataset_test, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=0
+    )
 
     if args.no_fourier:
         assert dataset_train.n_node == args.num_modes, "Number of modes must be the same as the number of atoms" 
@@ -247,7 +278,7 @@ def main():
             solver=args.solver,
             rtol=args.rtol,
             atol=args.atol,
-            delta_frame=delta_frame,
+            delta_frame=train_delta_frame,  # if your model logic needs the train delta frame
             fourier_basis=args.fourier_basis,
             no_ode=args.no_ode,
             no_fourier=args.no_fourier,

@@ -50,7 +50,9 @@ parser.add_argument('--norm_diff', type=eval, default=False, metavar='N',
 parser.add_argument('--tanh', type=eval, default=False, metavar='N',
                     help='use tanh')
 parser.add_argument('--delta_frame', type=int, default=50,
-                    help='Number of frames delta.')
+                    help='Number of frames delta for training.')
+parser.add_argument('--delta_frame_eval', type=int, default=None,
+                    help='Number of frames delta for validation/testing (up-sampling mode).')
 parser.add_argument('--mol', type=str, default='aspirin',
                     help='Name of the molecule.')
 parser.add_argument('--data_dir', type=str, default='',
@@ -112,6 +114,10 @@ parser.add_argument('--propagate_x', type=eval, default=True,
 parser.add_argument('--propagate_h', type=eval, default=True,
                     help='If True, propagate the hidden features h in ODE, else skip.')
 
+# Add dataset type argument to specify MD17, RMD17, or MD22
+parser.add_argument('--dataset_type', type=str, default='md17', choices=['md17', 'md22', 'rmd17'],
+                    help='Dataset type: md17, md22, or rmd17')
+
 args = parser.parse_args()
 if args.config_by_file:
     job_param_path = 'configs/' + args.config
@@ -125,12 +131,29 @@ if args.config_by_file:
 # assert torch.cuda.is_available(), "no cuda device available"
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
+# Check if the molecule has a "revised_" prefix to determine if it's from RMD17
+is_revised = args.mol.startswith("revised_")
+
 if args.mol == "ala2": 
     from ala.dataset import AlanineDataset as MoleculeDynamicsDataset 
-elif args.mol in ["aspirin", "benzene_old", "ethanol", "malonaldehyde", "naphthalene", "salicylic", "toluene", "uracil"]: 
+elif args.mol in ["aspirin", "benzene_old", "ethanol", "malonaldehyde", "naphthalene", "salicylic", "toluene", "uracil"] and not is_revised: 
     from md17.dataset import MD17DynamicsDataset as MoleculeDynamicsDataset
+    args.dataset_type = 'md17'  # Force dataset_type to match molecule
+elif args.mol in ["buckyball-catcher", "AT-AT-CG-CG", "AT-AT", "stachyose", "double-walled_nanotube", "Ac-Ala3-NHMe", "DHA"]:
+    from md22.dataset import MD22DynamicsDataset as MoleculeDynamicsDataset
+    args.dataset_type = 'md22'  # Force dataset_type to match molecule
+elif is_revised or args.mol.replace("revised_", "") in ["aspirin", "benzene", "ethanol", "malonaldehyde", "naphthalene", "salicylic", "toluene", "uracil", "azobenzene", "paracetamol"]:
+    from rmd17.dataset import RMD17DynamicsDataset as MoleculeDynamicsDataset
+    args.dataset_type = 'rmd17'  # Force dataset_type to match molecule
+    # Ensure molecule has the "revised_" prefix
+    if not is_revised:
+        args.mol = "revised_" + args.mol
 else: 
     raise ValueError(f"Molecule {args.mol} not supported") 
+
+# Set up train vs eval delta_frame
+train_delta_frame = args.delta_frame
+eval_delta_frame = args.delta_frame_eval if (args.delta_frame_eval is not None) else train_delta_frame
 
 
 device = torch.device("cuda" if args.cuda else "cpu")
@@ -152,6 +175,12 @@ else:
 
 if not args.no_fourier: 
     assert args.fourier_basis in ['linear', 'graph'], "fourier_basis must be either 'linear' or 'graph'"
+
+# Adjust output folder based on dataset type
+if args.dataset_type == 'md22':
+    args.outf = args.outf.replace('md17', 'md22')
+elif args.dataset_type == 'rmd17':
+    args.outf = args.outf.replace('md17', 'rmd17')
 
 try:
     os.makedirs(args.outf)
@@ -202,28 +231,53 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    dataset_train = MoleculeDynamicsDataset(partition='train', max_samples=args.max_training_samples, data_dir=args.data_dir,
-                                            molecule_type=args.mol, delta_frame=args.delta_frame,
-                                            num_timesteps=args.num_timesteps, 
-                                            uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
-    loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True, drop_last=True,
-                                               num_workers=0)
+    # Training dataset: use training delta_frame
+    dataset_train = MoleculeDynamicsDataset(
+        partition='train',
+        max_samples=args.max_training_samples,
+        data_dir=args.data_dir if args.data_dir else args.dataset_type,  # Use dataset_type as default data_dir
+        molecule_type=args.mol,
+        delta_frame=train_delta_frame,
+        num_timesteps=args.num_timesteps, 
+        uneven_sampling=args.uneven_sampling,
+        internal_seed=args.internal_seed,
+        time_ref=train_delta_frame  # <--- pass training delta_frame for time normalization
+    )
+    loader_train = torch.utils.data.DataLoader(
+        dataset_train, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=0
+    )
 
-    dataset_val = MoleculeDynamicsDataset(partition='val', max_samples=2000, data_dir=args.data_dir,
-                                          molecule_type=args.mol, delta_frame=args.delta_frame,
-                                          num_timesteps=args.num_timesteps, 
-                                          uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
-    loader_val = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size, shuffle=False, drop_last=False,
-                                             num_workers=0)
+    # Validation dataset: use smaller (eval) delta_frame but still normalize times by training frame
+    dataset_val = MoleculeDynamicsDataset(
+        partition='val',
+        max_samples=2000,
+        data_dir=args.data_dir if args.data_dir else args.dataset_type,  # Use dataset_type as default data_dir
+        molecule_type=args.mol,
+        delta_frame=eval_delta_frame,
+        num_timesteps=args.num_timesteps,
+        uneven_sampling=args.uneven_sampling,
+        internal_seed=args.internal_seed,
+        time_ref=train_delta_frame  # <--- normalizing times by the train delta frame
+    )
+    loader_val = torch.utils.data.DataLoader(
+        dataset_val, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=0
+    )
 
-    dataset_test = MoleculeDynamicsDataset(partition='test', max_samples=2000, data_dir=args.data_dir,
-                                           molecule_type=args.mol, delta_frame=args.delta_frame,
-                                           num_timesteps=args.num_timesteps, 
-                                           uneven_sampling=args.uneven_sampling, internal_seed=args.internal_seed)
-    loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=args.batch_size, shuffle=False, drop_last=False,
-                                              num_workers=0)
-
-    delta_frame = args.delta_frame
+    # Test dataset: same approach
+    dataset_test = MoleculeDynamicsDataset(
+        partition='test',
+        max_samples=2000,
+        data_dir=args.data_dir if args.data_dir else args.dataset_type,  # Use dataset_type as default data_dir
+        molecule_type=args.mol,
+        delta_frame=eval_delta_frame,
+        num_timesteps=args.num_timesteps,
+        uneven_sampling=args.uneven_sampling,
+        internal_seed=args.internal_seed,
+        time_ref=train_delta_frame  # <--- normalizing times by the train delta frame
+    )
+    loader_test = torch.utils.data.DataLoader(
+        dataset_test, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=0
+    )
 
     if args.no_fourier:
         assert dataset_train.n_node == args.num_modes, "Number of modes must be the same as the number of atoms" 
@@ -247,7 +301,7 @@ def main():
             solver=args.solver,
             rtol=args.rtol,
             atol=args.atol,
-            delta_frame=delta_frame,
+            delta_frame=train_delta_frame,  # if your model logic needs the train delta frame
             fourier_basis=args.fourier_basis,
             no_ode=args.no_ode,
             no_fourier=args.no_fourier,

@@ -115,8 +115,8 @@ parser.add_argument('--propagate_h', type=eval, default=True,
                     help='If True, propagate the hidden features h in ODE, else skip.')
 
 # Add dataset type argument to specify MD17, RMD17, or MD22
-parser.add_argument('--dataset_type', type=str, default='md17', choices=['md17', 'md22', 'rmd17'],
-                    help='Dataset type: md17, md22, or rmd17')
+parser.add_argument('--dataset_type', type=str, default='md17', choices=['md17', 'md22', 'rmd17', 'desres'],
+                    help='Dataset type: md17, md22, rmd17, or desres')
 
 args = parser.parse_args()
 if args.config_by_file:
@@ -148,6 +148,8 @@ elif is_revised or args.mol.replace("revised_", "") in ["aspirin", "benzene", "e
     # Ensure molecule has the "revised_" prefix
     if not is_revised:
         args.mol = "revised_" + args.mol
+elif args.dataset_type == 'desres':
+    from desres.dataset import DESRESDataset as MoleculeDynamicsDataset
 else: 
     raise ValueError(f"Molecule {args.mol} not supported") 
 
@@ -181,6 +183,8 @@ if args.dataset_type == 'md22':
     args.outf = args.outf.replace('md17', 'md22')
 elif args.dataset_type == 'rmd17':
     args.outf = args.outf.replace('md17', 'rmd17')
+elif args.dataset_type == 'desres':
+    args.outf = args.outf.replace('md17', 'desres')
 
 try:
     os.makedirs(args.outf)

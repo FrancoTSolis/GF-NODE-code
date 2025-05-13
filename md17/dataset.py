@@ -102,7 +102,7 @@ class MD17DynamicsDataset(MD17Dataset):
 
     """
     def __init__(self, partition, max_samples, delta_frame, data_dir, molecule_type, num_timesteps=8, 
-                 uneven_sampling=False, internal_seed=None):
+                 uneven_sampling=False, internal_seed=None, time_ref=None):
         # setup a split, tentative setting
         train_par, val_par, test_par = 0.1, 0.05, 0.05
         full_dir = os.path.join(data_dir, 'md17_' + molecule_type + '.npz')

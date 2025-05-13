@@ -187,6 +187,8 @@ class RMD17DynamicsDataset(RMD17Dataset):
         v = v[:, z > 1, ...]
         z = z[z > 1]
 
+        print('mol idx after filtering:', z)
+
         x_0, v_0 = x[st], v[st]  # Initial positions and velocities at start frames
 
         if self.uneven_sampling:
